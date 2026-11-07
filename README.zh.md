@@ -121,6 +121,7 @@ vendored 副本已同步到上游 `c5c264d`（2026-10-15）。本 fork 最初自
 |---|---|
 | 向量定点转换 `SCVTF/UCVTF/FCVTZS/FCVTZU #fbits` gadget（仍为 DSH 本地补丁） | libvips（dsh 图片附件插件 `sharp` 用到）会在这些指令上触发非法指令 |
 | `uname()` 的主机名拷贝改用 `snprintf` 限界 | 宿主 nodename 超过 64 字节时，启用 fortify 的 libc `stpcpy` 会直接终止进程（CI runner 上可见） |
+| `sys_truncate64` 给 `generic_setattrat` 传 `AT_PWD`（而非 `NULL`） | 上游 `path_normalize` 断言 `at != NULL`，guest 里 `truncate()` 会直接终止宿主模拟器 |
 | 流式 `fetch()` polyfill（`app/RootfsPatch.bundle`，现为上游的 undici global dispatcher，version 6） | undici 的 LLM 流式（SSE）需要 WebAssembly，而 jitless V8 没有 |
 | `ISHShellExecutor` 返回 shell 退出码并在进程退出后排空管道；`ContainerURL()` 在没有 app group 时回退；部署目标 15.0 | app 集成需要 |
 

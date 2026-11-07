@@ -151,6 +151,7 @@ The vendored copy was synced to upstream `c5c264d` (2026-10-15). The `FCVTL/FCVT
 |---|---|
 | Vector fixed-point `SCVTF/UCVTF/FCVTZS/FCVTZU #fbits` gadgets (still DSH-local) | libvips (used by `sharp`, dsh's image-attachment plugin) traps on them |
 | `uname()` hostname copy bounded with `snprintf` | a fortified libc `stpcpy` aborts the process when the host nodename exceeds 64 bytes (CI runners) |
+| `sys_truncate64` passes `AT_PWD` (not `NULL`) to `generic_setattrat` | upstream `path_normalize` asserts `at != NULL` — a guest `truncate()` aborted the host emulator |
 | Streaming `fetch()` polyfill (`app/RootfsPatch.bundle`, now upstream's undici global dispatcher, version 6) | LLM streaming (SSE) via undici needs WebAssembly, which jitless V8 lacks |
 | `ISHShellExecutor` returns shell exit codes and drains pipes after exit; `ContainerURL()` falls back without an app group; deployment target 15.0 | app integration |
 

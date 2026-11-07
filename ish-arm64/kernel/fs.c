@@ -1217,7 +1217,7 @@ dword_t sys_truncate64(addr_t path_addr, off_t_ size) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
-    return generic_setattrat(NULL, path, make_attr(size, size), true);
+    return generic_setattrat(AT_PWD, path, make_attr(size, size), true);
 }
 
 dword_t sys_ftruncate64(fd_t f, off_t_ size) {
@@ -1247,7 +1247,7 @@ dword_t sys_truncate64(addr_t path_addr, dword_t size_low, dword_t size_high) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
-    return generic_setattrat(NULL, path, make_attr(size, size), true);
+    return generic_setattrat(AT_PWD, path, make_attr(size, size), true);
 }
 
 dword_t sys_ftruncate64(fd_t f, dword_t size_low, dword_t size_high) {

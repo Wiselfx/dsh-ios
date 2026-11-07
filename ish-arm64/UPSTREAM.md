@@ -5,6 +5,9 @@ This directory is a vendored copy of https://github.com/OpenMinis/ish-arm64
 "Merge pull request #48 from OpenMinis/feat/aot-family-match"), itself a fork of
 https://github.com/ish-app/ish. It includes the changes DSH needs on top of the
 upstream snapshot (see `../dsh-ios/README.md`, "Changes made to the emulator").
+Local fixes on top of upstream master: `sys_truncate64` passes `AT_PWD` (not
+`NULL`) to `generic_setattrat`, because upstream's `path_normalize` asserts
+`at != NULL` — `truncate()` aborted the host emulator otherwise.
 The previous snapshot (`7e100366a4b59557a4a0c4657d0d6115e99d1f5e`, 2026-08-13)
 carried the FCVT/FCVTXN gadgets, the FMOV imm8 fix and the waitpid EINTR fix as
 local patches; those landed in upstream as #22 and #29 and the local copies were
