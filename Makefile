@@ -1,7 +1,7 @@
 # DSH — DeepSeek Harness for iPad/iPhone
 #
 #   make emulator      build the iSH-ARM64 CLI (needed by rootfs + tests)
-#   make rootfs        build build/root.tar.gz (Alpine + Node 22 + dsh)
+#   make rootfs        build build/root.tar.gz (Alpine + Node 24 + dsh)
 #   make project       (re)generate DSH.xcodeproj (run after adding/removing source files)
 #   make app           signed device build (DSH.app)
 #   make install       build + install on the connected iPad (DEVICE=<udid>)

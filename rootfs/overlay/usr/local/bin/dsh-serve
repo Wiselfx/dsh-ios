@@ -28,4 +28,4 @@ cd "$DSH_WORKSPACE"
 # node-addon-require-builtin shim has no musl build, so use the flag instead.
 exec node --expose-internals \
     /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js \
-    web --host 127.0.0.1 --port "$PORT" "$@"
+    web --host 127.0.0.1 --port "$PORT" --no-open "$@"

@@ -8,7 +8,7 @@ which this plan references rather than repeats.
 
 | Area | State |
 |---|---|
-| Guest: Alpine 3.21 + Node 22 + dsh 0.1, reproducible image | done |
+| Guest: Alpine 3.23 + Node 24 + dsh 0.2.2-rc.1, reproducible image | done |
 | App: WKWebView front end, supervised `dsh web`, terminal, server log | done |
 | Background boot with progress + ETA (launch watchdog safe) | done |
 | Guest image auto-upgrade with user-data migration | done |

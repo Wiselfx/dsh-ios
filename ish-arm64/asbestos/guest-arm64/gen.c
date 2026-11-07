@@ -24,6 +24,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "asbestos/gen.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 #include "emu/arch/arm64/decode.h"
 #include "emu/interrupt.h"
 
@@ -552,6 +555,9 @@ extern void gadget_fcvtps_int_vec(void);   // FCVTPS (toward +inf, signed)
 extern void gadget_fcvtpu_int_vec(void);   // FCVTPU (toward +inf, unsigned)
 extern void gadget_fcvtas_int_vec(void);   // FCVTAS (ties away, signed)
 extern void gadget_fcvtau_int_vec(void);   // FCVTAU (ties away, unsigned)
+extern void gadget_fcvtn_vec(void);        // FCVTN/FCVTN2 (narrow: 4S->4H, 2D->2S)
+extern void gadget_fcvtl_vec(void);        // FCVTL/FCVTL2 (widen: 4H->4S, 2S->2D)
+extern void gadget_fcvtxn_vec(void);       // FCVTXN/FCVTXN2 (narrow 2D->2S, round to odd)
 extern void gadget_frintn_vec_vec(void);   // FRINTN (round to nearest, ties to even)
 extern void gadget_frinta_vec_vec(void);   // FRINTA (round to nearest, ties away)
 extern void gadget_frintp_vec_vec(void);   // FRINTP (round toward +inf)
@@ -571,10 +577,6 @@ extern void gadget_fneg_vec_vec(void);     // FNEG Vd, Vn (vector negate)
 extern void gadget_fsqrt_vec_vec(void);    // FSQRT Vd, Vn (vector square root)
 extern void gadget_frecpe_vec_vec(void);   // FRECPE Vd, Vn (vector reciprocal estimate)
 extern void gadget_frsqrte_vec_vec(void);  // FRSQRTE Vd, Vn (vector rsqrt estimate)
-// Vector FP widening/narrowing conversions
-extern void gadget_fcvtl_vec(void);        // FCVTL{2} Vd.4S/2D, Vn.4H/8H/2S/4S
-extern void gadget_fcvtn_vec(void);        // FCVTN{2} Vd.4H/8H/2S/4S, Vn.4S/2D
-extern void gadget_fcvtxn_vec(void);       // FCVTXN{2} Vd.2S/4S, Vn.2D
 // Vector fixed-point conversions (shift-by-immediate class)
 extern void gadget_scvtf_fixpt_vec(void);  // SCVTF Vd, Vn, #fbits
 extern void gadget_ucvtf_fixpt_vec(void);  // UCVTF Vd, Vn, #fbits
@@ -886,15 +888,28 @@ extern void gadget_fused_subs_reg_bcond_le(void);
 
 static void gen(struct gen_state *state, unsigned long thing) {
     assert(state->size <= state->capacity);
+    // Once the buffer has failed to grow, stop writing. The remaining gadgets
+    // for this instruction are dropped, but the block is discarded wholesale by
+    // fiber_block_compile(), so a half-emitted stream is never executed.
+    if (state->oom)
+        return;
     if (state->size >= state->capacity) {
-        state->capacity *= 2;
+        unsigned new_capacity = state->capacity * 2;
         struct fiber_block *new_block = realloc(state->block,
-                sizeof(*new_block) + state->capacity * sizeof(unsigned long));
+                sizeof(*new_block) + new_capacity * sizeof(unsigned long));
         if (new_block == NULL) {
-            abort();
+            // Aborting here killed the entire app -- every guest thread, plus
+            // the Swift UI side -- because one guest process asked for more
+            // memory than was available. Record the failure instead and let the
+            // compile fail; the run loop raises INT_GPF, which kills only the
+            // guest process that could not be compiled. [T-ish-jit-oom-abort]
+            state->oom = true;
+            return;
         }
+        state->capacity = new_capacity;
         state->block = new_block;
     }
+    assert(state->size < state->capacity);
     state->block->code[state->size++] = thing;
 }
 
@@ -913,6 +928,8 @@ bool gen_start(addr_t addr, struct gen_state *state) {
     state->ip = addr;
     state->last_insn = 0;
     state->b_follow_depth = 0;
+    state->oom = false;
+    state->units = false;
     for (int i = 0; i <= 1; i++) {
         state->jump_ip[i] = 0;
     }
@@ -923,6 +940,9 @@ bool gen_start(addr_t addr, struct gen_state *state) {
         return false;
     state->block = block;
     block->addr = addr;
+#ifdef ISH_JIT
+    jit_block_init(block);
+#endif
     return true;
 }
 
@@ -1002,7 +1022,9 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     //   cbnz Xr, skip             ; still referenced → skip
     // On match, emit one gadget_decref and consume all five instructions. This is
     // the single hottest inlined pattern in _PyEval_EvalFrameDefault.
-    if ((insn & 0xffc00000) == 0xf9400000u &&         // LDR Xr, [Xobj, #imm]
+    // Not for the JIT, whose units take at most two instructions.
+    if (!state->units &&
+        (insn & 0xffc00000) == 0xf9400000u &&         // LDR Xr, [Xobj, #imm]
         ((insn >> 10) & 0xfff) == 0) {                // imm offset == 0
         uint32_t r   = insn & 0x1f;
         uint32_t obj = (insn >> 5) & 0x1f;
@@ -1044,7 +1066,9 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     // The b.eq target is the instruction right after the str, so BOTH paths fall
     // through to the next opcode — no branch out of the block. This is the LOAD_FAST
     // / dup-ref hot path, dual of DECREF but with no dealloc branch (always fast).
-    if ((insn & 0xffc00000) == 0xb9400000u &&         // LDR Wr, [Xobj, #imm]
+    // Not for the JIT, whose units take at most two instructions.
+    if (!state->units &&
+        (insn & 0xffc00000) == 0xb9400000u &&         // LDR Wr, [Xobj, #imm]
         ((insn >> 10) & 0xfff) == 0) {                // imm offset == 0
         uint32_t r   = insn & 0x1f;
         uint32_t obj = (insn >> 5) & 0x1f;
@@ -1601,7 +1625,8 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         // Most common pair across CPython workloads (~4.5% of dispatches).
         // Conditions: 32-bit (sf=0), opc=0, rn!=31, rd!=31, follow-up CMP wd,#imm12
         // (sf=0, op=1, S=1, rd=31), follow-up B.cond with cond ∈ supported set.
-        if (opc == 0 && !sf && rn != 31 && rd != 31) {
+        // Not for the JIT, whose units take at most two instructions.
+        if (opc == 0 && !sf && rn != 31 && rd != 31 && !state->units) {
             uint32_t cmp_insn, br_insn;
             if (gen_peek_next_insn(state, &cmp_insn)) {
                 // CMP Wn, #imm12: SUBS WZR, Wn, #imm12  (32-bit, op=1, S=1, sh=0, rd=31, rn=rd_of_AND)
@@ -2002,9 +2027,22 @@ static int gen_branch(struct gen_state *state, uint32_t insn) {
                 gen(state, rn);
                 break;
             case 1:  // BLR
+#ifdef ISH_JIT
+                // [gadget][block_self_ptr][return_addr][return_cont][rn]: the
+                // first words match BL so an indirect call fills ret_cache too
+                // and its RET (gadget or native) stays out of the run loop.
+                gen(state, (unsigned long) gadget_branch_link_reg);
+                gen(state, 0);                                        // block self-pointer (gen_end)
+                gen(state, state->ip);                                // return address
+                gen(state, (unsigned long) state->ip | (1UL << 63));  // return continuation (chained)
+                gen(state, rn);
+                state->block_patch_ip = state->size - 4;
+                state->jump_ip[0] = state->size - 2;
+#else
                 gen(state, (unsigned long) gadget_branch_link_reg);
                 gen(state, rn);
                 gen(state, state->ip);  // return address
+#endif
                 break;
             case 2:  // RET
                 gen(state, (unsigned long) gadget_ret);
@@ -5543,21 +5581,36 @@ skip_three_different:
         return 1;
     }
 
-    // FCVTL{2}/FCVTN{2}/FCVTXN{2} - AdvSIMD two-register misc widen/narrow
-    // FCVTL:  0 Q 0 01110 0 sz 10000 10111 10 Rn Rd  (opcode=0x17)
-    // FCVTN:  0 Q 0 01110 0 sz 10000 10110 10 Rn Rd  (opcode=0x16)
-    // FCVTXN: 0 Q 1 01110 1 sz 10000 10110 10 Rn Rd  (opcode=0x16, sz must be 1)
-    {
-        uint32_t base = insn & 0xbffffc00;  // keep U, size, sz, opcode; drop Q
+    // AdvSIMD vector FP lane narrow/widen: FCVTN{2}, FCVTL{2}, FCVTXN{2}
+    // Format: 0 Q U 01110 sz 10000 opcode 10 Rn Rd, opcode 0x16 (N) / 0x17 (L, XN)
+    // These are handled before the generic two-register-misc block below because
+    // that block rejects sz=1 with Q=0, which is legal for all three of these
+    // (FCVTN Vd.2s, FCVTL Vd.2d and FCVTXN Vd.2s are all Q=0 forms).
+    if ((insn & 0xbfbff800) == 0x0e216800 ||   // FCVTN{2}   (U=0, opcode 0x16)
+        (insn & 0xbfbff800) == 0x0e217800 ||   // FCVTL{2}   (U=0, opcode 0x17)
+        (insn & 0xbfbff800) == 0x2e216800) {   // FCVTXN{2}  (U=1, opcode 0x16)
+        uint32_t Q = (insn >> 30) & 1;
+        uint32_t U = (insn >> 29) & 1;
+        uint32_t opcode = (insn >> 12) & 0x1f;
+        uint32_t sz = (insn >> 22) & 1;
+        uint32_t rn = (insn >> 5) & 0x1f;
+        uint32_t rd = insn & 0x1f;
+
         void *gadget = NULL;
-        if (base == 0x0e217800 || base == 0x0e617800) gadget = gadget_fcvtl_vec;
-        else if (base == 0x0e216800 || base == 0x0e616800) gadget = gadget_fcvtn_vec;
-        else if (base == 0x2e616800) gadget = gadget_fcvtxn_vec;
+        if (opcode == 0x16 && U == 0) {
+            gadget = gadget_fcvtn_vec;
+        } else if (opcode == 0x17 && U == 0) {
+            gadget = gadget_fcvtl_vec;
+        } else if (opcode == 0x16 && U == 1) {
+            // FCVTXN only narrows double->single; sz=0 is unallocated.
+            if (sz == 0) {
+                gen_interrupt(state, INT_UNDEFINED);
+                return 0;
+            }
+            gadget = gadget_fcvtxn_vec;
+        }
+
         if (gadget) {
-            uint32_t Q = (insn >> 30) & 1;
-            uint32_t rn = (insn >> 5) & 0x1f;
-            uint32_t rd = insn & 0x1f;
-            uint32_t sz = (insn >> 22) & 1;
             gen(state, (unsigned long) gadget);
             gen(state, rd | (rn << 8) | (sz << 16) | (Q << 24));
             return 1;
@@ -5963,10 +6016,16 @@ skip_three_different:
     // Mask 0xff201fe0 checks fixed bits, ignores ftype, imm8, Rd
     if ((insn & 0xff201fe0) == 0x1e201000) {
         uint32_t ftype = (insn >> 22) & 3;
-        uint32_t imm8 = ((insn >> 13) & 0xff) ^ 0x40;  // bit 6 is stored inverted
+        uint32_t imm8_raw = (insn >> 13) & 0xff;
         uint32_t rd = insn & 0x1f;
         bool is_double = (ftype == 1);
 
+        // arm64_fpimm_to_bits() expects bit6 already inverted -- see the other
+        // caller in gen_simd_fp(). This path passed the raw imm8 instead, so
+        // every scalar FMOV #imm came out scaled by 8x (e.g. #0.71875 -> 11.5).
+        // V8's ieee754::cos loads its C1/C2 range-reduction constants this way,
+        // which is why cos(x) returned x+15 for |x| just under pi/4.
+        uint32_t imm8 = imm8_raw ^ 0x40;
         uint64_t fpbits = arm64_fpimm_to_bits(is_double, imm8);
 
         gen(state, (unsigned long) gadget_fmov_fp_imm);

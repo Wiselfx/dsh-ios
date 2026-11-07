@@ -18,5 +18,5 @@ Third-party components:
 | Alpine Linux packages (busybox, musl, Node.js, git, …) | various (GPL, MIT, BSD, …) | shipped inside the guest image `root.tar.gz` |
 
 The guest image is built reproducibly by `scripts/build-rootfs.sh` from the
-Alpine 3.21 aarch64 repositories and the pinned npm manifest in
+Alpine 3.23 aarch64 repositories and the pinned npm manifest in
 `rootfs/staging`; corresponding sources are available from those upstreams.

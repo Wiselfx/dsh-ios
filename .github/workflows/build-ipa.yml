@@ -52,9 +52,12 @@ jobs:
       - name: Build iSH-ARM64 emulator (CLI + fakefsify)
         run: make emulator
 
-      - name: Build guest rootfs (Alpine + Node 22 + dsh)
+      - name: Build guest rootfs (Alpine + Node 24 + dsh)
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: make rootfs
+
+      - name: Guest self-test (import image, boot dsh, mock LLM round trip)
+        run: tests/rootfs-test.sh
 
       - name: Build unsigned DSH.app
         run: |

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,13 +55,25 @@ struct task *task_create_(struct task *parent) {
     list_init(&pid->pgroup);
 
     struct task *task = malloc(sizeof(struct task));
-    if (task == NULL)
+    if (task == NULL) {
+        // Release pids_lock before bailing out. Returning while still holding
+        // it wedged the whole kernel: every later task_create_, pid_get_task
+        // and signal delivery blocks on this lock forever, so an allocation
+        // failure turned into a total freeze instead of one failed fork.
+        // Also roll back the pid slot claimed above, which would otherwise be
+        // permanently reserved for a task that was never created.
+        pid->id = 0;
+        pid->task = NULL;
+        unlock(&pids_lock);
         return NULL;
+    }
     *task = (struct task) {};
     if (parent != NULL)
         *task = *parent;
     task->pid = pid->id;
     pid->task = task;
+    // Copied from the parent above; a new task has not begun exiting.
+    atomic_store(&task->exit_started, false);
 
 #ifdef GUEST_ARM64
     // Invalidate exclusive monitor after copying parent state.
@@ -152,6 +165,9 @@ void task_destroy(struct task *task) {
 }
 
 static void task_run_tlb_cleanup(void *arg) {
+#ifdef GUEST_ARM64
+    tlb_detach((struct tlb *) arg);   // exited while running guest code
+#endif
     tlb_free((struct tlb *)arg);
     // [T-ish-mm-leak-refcount-handoff] If the do_exit_group safety valve
     // orphaned this thread (stuck in an uninterruptible host syscall) it
@@ -163,9 +179,20 @@ static void task_run_tlb_cleanup(void *arg) {
     struct task *self = current;
     if (self != NULL && self->mm_release_deferred && self->mm != NULL) {
         self->mm_release_deferred = false;
-        mm_release(self->mm);
+        // [T-ish-exit-mm-general-lock] Same handoff as do_exit: unpublish the
+        // mm under general_lock so a procfs reader cannot lock it after we
+        // destroy it, then release outside the lock.
+        lock(&self->general_lock);
+        struct mm *mm = self->mm;
         self->mm = NULL;
         self->mem = NULL;
+        unlock(&self->general_lock);
+        // [T-ish-mm-diag] The other half of the SAFETY-VALVE line: when the
+        // leaked thread finally unwinds and releases, and what refcount it
+        // finds — a value other than 1 here means a second holder.
+        printk("[iSH][DEFERRED-RELEASE] pid=%d mm_release from cleanup handler, mm=%p refcount_before=%u\n",
+               self->pid, (void *) mm, (unsigned) mm->refcount);
+        mm_release_from(mm, "cleanup_handler");
     }
 }
 
@@ -199,8 +226,14 @@ void task_run_current() {
             pthread_exit(NULL);
         }
         read_wrlock(&self->mem->lock);
+#ifdef GUEST_ARM64
+        tlb_attach(tlb, &self->mem->mmu);
+#endif
         tlb_refresh(tlb, &self->mem->mmu);
         int interrupt = cpu_run_to_interrupt(cpu, tlb);
+#ifdef GUEST_ARM64
+        tlb_detach(tlb);
+#endif
         read_wrunlock(&self->mem->lock);
         handle_interrupt(interrupt);
     }
@@ -223,9 +256,16 @@ __attribute__((constructor)) static void create_attr() {
     pthread_attr_setdetachstate(&task_thread_attr, PTHREAD_CREATE_DETACHED);
 }
 
-void task_start(struct task *task) {
-    if (pthread_create(&task->thread, &task_thread_attr, task_thread, task) < 0)
-        die("could not create thread");
+int task_start(struct task *task) {
+    // pthread_create returns an errno directly and never -1, so the old
+    // "< 0" test never fired and a failure fell through to a task whose
+    // thread was never started. Under thread-stack exhaustion (EAGAIN) that
+    // has to become a guest-visible clone() failure, not a dead task or a
+    // die(). [T-ish-jit-oom-abort]
+    int err = pthread_create(&task->thread, &task_thread_attr, task_thread, task);
+    if (err != 0)
+        return err == EAGAIN ? _EAGAIN : _ENOMEM;
+    return 0;
 }
 
 int_t sys_sched_yield() {

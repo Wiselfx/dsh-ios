@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the guest root filesystem bundled into the DSH iOS app:
-#   Alpine 3.21 (aarch64) + Node.js 22 + @deepseek-ai/dsh (+ rebuilt node-pty)
+#   Alpine 3.23 (aarch64) + Node.js 24 + @deepseek-ai/dsh (+ rebuilt node-pty)
 #
 # Everything guest-side runs inside the iSH-ARM64 CLI emulator on macOS, so the
 # result is byte-for-byte what the app boots. Output: build/root.tar.gz
@@ -15,11 +15,11 @@ ISH_BUILD="${ISH_BUILD:-$ISH_SRC/build-arm64-release}"
 WORK="${WORK:-$ROOT/build/rootfs-work}"
 OUT="${OUT:-$ROOT/build/root.tar.gz}"
 
-ALPINE_VER=3.21
+ALPINE_VER=3.23
 ALPINE_TARBALL="alpine-minirootfs-${ALPINE_VER}.0-aarch64.tar.gz"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VER}/releases/aarch64/${ALPINE_TARBALL}"
 # Pinned dsh release; bump together with package-lock.json under rootfs/staging.
-DSH_VERSION="${DSH_VERSION:-0.1.0-rc.7}"
+DSH_VERSION="${DSH_VERSION:-0.2.2-rc.1}"
 
 log() { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }

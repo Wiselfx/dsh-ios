@@ -20,7 +20,7 @@
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/iOS%20%7C%20iPadOS-16%2B-blue">
-  <img alt="Guest" src="https://img.shields.io/badge/guest-Alpine%203.21%20%C2%B7%20Node%2022%20%C2%B7%20dsh%200.1-1f6feb">
+  <img alt="Guest" src="https://img.shields.io/badge/guest-Alpine%203.23%20%C2%B7%20Node%2024%20%C2%B7%20dsh%200.2.2-rc.1-1f6feb">
   <img alt="Tests" src="https://img.shields.io/badge/tests-emu%20%C2%B7%20rootfs%20%C2%B7%20XCTest%20%C2%B7%20XCUITest-success">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-green"></a>
 </p>
@@ -31,7 +31,7 @@
 > If you would like to try it, please download the source and build it yourself.
 
 DSHIOS is a native iOS app that embeds the [iSH-ARM64](ish-arm64) userspace Linux
-emulator, boots a bundled Alpine Linux image with Node.js 22 and
+emulator, boots a bundled Alpine Linux image with Node.js 24 and
 `@deepseek-ai/dsh`, supervises `dsh web`, and shows the harness's own web UI in
 a `WKWebView`. The agent loop, sessions, tools and the shell all run on the
 device. Model requests use the standard DeepSeek API configured in the harness.
@@ -59,7 +59,7 @@ stock dsh web UI.</sub>
 
 ## Features
 
-- **Standard DeepSeek API** — Alpine 3.21, Node 22 and dsh run inside the app;
+- **Standard DeepSeek API** — Alpine 3.23, Node 24 and dsh run inside the app;
   model inference uses DeepSeek's API and the harness manages its API key.
 - **The real harness UI** — dsh's own web app served on loopback: sessions,
   workspaces, tools, permission presets, settings.
@@ -95,7 +95,7 @@ without it.)
 ```bash
 git clone https://github.com/everettjf/dsh-ios.git && cd dsh-ios
 make emulator        # iSH-ARM64 CLI + fakefsify (used to build and test the guest image)
-make rootfs          # build/root.tar.gz — Alpine + Node 22 + dsh (~81 MB, ~6 min, needs network)
+make rootfs          # build/root.tar.gz — Alpine + Node 24 + dsh (~81 MB, ~6 min, needs network)
 open DSH.xcodeproj   # DSH scheme → your iPad → set the team → Run
 ```
 
@@ -117,7 +117,7 @@ prompted; it is stored with the harness settings in the guest.
 │         │                                        ▲                │
 │  DSHHarness  (port pick · readiness probe · restart · health)     │
 │         │  ISHShellExecutor                      │ loopback       │
-│  ┌──────▼──── iSH-ARM64 emulator (Alpine 3.21 aarch64) ───────┐   │
+│  ┌──────▼──── iSH-ARM64 emulator (Alpine 3.23 aarch64) ───────┐   │
 │  │  /usr/local/bin/dsh-serve                                  │   │
 │  │    → node --expose-internals @deepseek-ai/dsh web          │   │
 │  │        --host 127.0.0.1 --port N  ─────────────────────────┘   │
@@ -145,15 +145,16 @@ prompted; it is stored with the harness settings in the guest.
 
 ### Changes made to the emulator (`ish-arm64`, vendored fork of OpenMinis/ish-arm64)
 
+The vendored copy was synced to upstream `c5c264d` (2026-10-15). The `FCVTL/FCVTL2`, `FCVTN/FCVTN2`, `FCVTXN/FCVTXN2` gadgets, the `FMOV (scalar, immediate)` imm8 fix and the `waitpid()` EINTR fix that this fork originally carried landed upstream (#22, #29) and are no longer local patches.
+
 | Change | Why |
 |---|---|
-| `FCVTL/FCVTL2`, `FCVTN/FCVTN2`, `FCVTXN/FCVTXN2` and vector fixed-point `SCVTF/UCVTF/FCVTZS/FCVTZU #fbits` gadgets | libvips (used by `sharp`, dsh's image-attachment plugin) traps on them |
-| `FMOV (scalar, immediate)` decoder fix | imm8 bit 6 was not inverted for constants such as `2.25` or `31.0` — every guest program computed wrong values |
-| `waitpid()` no longer returns `EINTR` when its 1 s bounded wait merely times out | broke gcc/g++ (`failed to get exit status`), node-gyp, anything waiting on a child > 1 s |
-| Streaming `fetch()` polyfill (`app/RootfsPatch.bundle`) returning real `Response` objects | LLM streaming (SSE) via undici needs WebAssembly, which jitless V8 lacks |
+| Vector fixed-point `SCVTF/UCVTF/FCVTZS/FCVTZU #fbits` gadgets (still DSH-local) | libvips (used by `sharp`, dsh's image-attachment plugin) traps on them |
+| `uname()` hostname copy bounded with `snprintf` | a fortified libc `stpcpy` aborts the process when the host nodename exceeds 64 bytes (CI runners) |
+| Streaming `fetch()` polyfill (`app/RootfsPatch.bundle`, now upstream's undici global dispatcher, version 6) | LLM streaming (SSE) via undici needs WebAssembly, which jitless V8 lacks |
 | `ISHShellExecutor` returns shell exit codes and drains pipes after exit; `ContainerURL()` falls back without an app group; deployment target 15.0 | app integration |
 
-The vendored copy records its upstream commit in [`ish-arm64/UPSTREAM.md`](ish-arm64/UPSTREAM.md); the fixes are self-contained and welcome upstream.
+The vendored copy records its upstream commit in [`ish-arm64/UPSTREAM.md`](ish-arm64/UPSTREAM.md). Note that dsh ≥ 0.2.x serves its web UI behind a per-process token (`dsh web` prints `http://127.0.0.1:<port>/?token=…` at boot); `DSHHarness` captures that URL from the guest's output and loads it in the web view, and the readiness probe treats any HTTP answer below 500 as alive.
 
 ## Tests
 

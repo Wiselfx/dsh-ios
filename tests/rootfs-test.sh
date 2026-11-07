@@ -69,7 +69,7 @@ echo "== guest sanity"
 guest 'node -v; dsh --version; dsh-selftest' > "$WORK/sanity.txt"
 sed 's/^/     /' "$WORK/sanity.txt"
 check "node >= 22.19 in guest" grep -Eq '^v(22\.(19|[2-9][0-9])|2[3-9]|[3-9][0-9])' "$WORK/sanity.txt"
-check "dsh 0.1.x in guest"      grep -Eq '^0\.1\.' "$WORK/sanity.txt"
+check "dsh 0.2.x in guest"      grep -Eq '^0\.2\.' "$WORK/sanity.txt"
 check "dsh-selftest passes"     grep -q 'SELFTEST OK' "$WORK/sanity.txt"
 check "sharp keeps musl arm64 runtime" test -d "$WORK/fakefs/data/usr/local/lib/node_modules/@img/sharp-linuxmusl-arm64"
 check "sharp drops unusable glibc runtime" test ! -e "$WORK/fakefs/data/usr/local/lib/node_modules/@img/sharp-linux-arm64"
@@ -178,18 +178,26 @@ echo "== boot dsh-serve on 127.0.0.1:$PORT (timeout ${BOOT_TIMEOUT}s)"
 start=$(date +%s)
 ( "$ISH_BUILD/ish" -f "$WORK/fakefs" /bin/sh -c "DSH_PORT=$PORT dsh-serve" 2>&1 | filter > "$WORK/dsh-serve.log" ) &
 up=0
+# dsh >= 0.2.x gates its UI behind a per-process token and prints the
+# authenticated URL at boot; poll the log for it, then use it (the 303 +
+# Set-Cookie dance needs a cookie jar).
 for _ in $(seq 1 "$BOOT_TIMEOUT"); do
     sleep 1
-    if curl -fs -o "$WORK/index.html" "http://127.0.0.1:$PORT/"; then up=1; break; fi
+    TOKEN_URL=$(grep -oE 'http://127\.0\.0\.1:[0-9]+/\?token=[A-Za-z0-9_-]+' "$WORK/dsh-serve.log" | head -1)
+    [ -z "$TOKEN_URL" ] && continue
+    if curl -fs -c "$WORK/cookies.txt" -L -o "$WORK/index.html" "$TOKEN_URL"; then up=1; break; fi
 done
 elapsed=$(( $(date +%s) - start ))
 check "web UI reachable from host loopback (${elapsed}s)" test "$up" = 1
 check "index carries __DSH_BOOT__ manifest" grep -q '__DSH_BOOT__' "$WORK/index.html"
 plugin_url=$(grep -o '/plugins/[^"]*client.js?rev=[0-9a-f]*' "$WORK/index.html" | head -1)
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$plugin_url")
+code=$(curl -s -b "$WORK/cookies.txt" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$plugin_url")
 check "client plugin bundle served ($plugin_url -> $code)" test "$code" = 200
 sleep 5
-check "server still alive after 5s" curl -fs -o /dev/null "http://127.0.0.1:$PORT/"
+check "server still alive after 5s" curl -fs -b "$WORK/cookies.txt" -o /dev/null "http://127.0.0.1:$PORT/"
+# Unauthenticated access must NOT be served (token fence).
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")
+check "unauthenticated request is refused ($code)" test "$code" = 401
 grep -Eq 'fatal|Error:' "$WORK/dsh-serve.log"; noerr=$?
 check "no fatal error in dsh-serve log" test "$noerr" != 0
 

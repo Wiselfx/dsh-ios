@@ -50,6 +50,10 @@ extern NSNotificationName const DSHHarnessStateDidChangeNotification;
 @property (nonatomic, readonly) uint16_t port;
 /// http://127.0.0.1:<port>/ once a port is chosen (may be nil before start).
 @property (nonatomic, readonly, nullable) NSURL *baseURL;
+/// The full token-authenticated URL printed by dsh on every launch (the web
+/// profile since dsh 0.2.x requires a per-process token); may be nil before
+/// the server prints it. Falls back to baseURL when unset.
+@property (nonatomic, readonly, nullable) NSURL *serverWebURL;
 @property (nonatomic, readonly) DSHLogBuffer *log;
 @property (nonatomic, readonly) NSUInteger restartCount;
 @property (nonatomic, readonly, nullable) NSString *lastError;

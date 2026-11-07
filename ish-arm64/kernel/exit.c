@@ -13,6 +13,9 @@
 #include "kernel/ptrace.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
+#ifdef ISH_JIT
+#include "asbestos/guest-arm64/jit.h"
+#endif
 
 static void halt_system(void);
 
@@ -72,6 +75,10 @@ noreturn void do_exit(int status) {
         current = NULL;
         pthread_exit(NULL);
     }
+    // [T-ish-exit-valve-progress] From here on this thread is leaving; tell
+    // do_exit_group's safety valve not to give up on it while it waits for
+    // pids_lock below.
+    atomic_store(&current->exit_started, true);
 
     // Block SIGSEGV during exit to prevent cosmetic crashes from host
     // pthread stack unwinding (especially with many threads exiting at once).
@@ -92,9 +99,33 @@ noreturn void do_exit(int status) {
     }
 
     // release all our resources (may already be NULL if force-released by do_exit_group)
+    //
+    // [T-ish-exit-mm-general-lock] general_lock protects task->mm/task->mem
+    // against procfs: /proc/<pid>/{cmdline,environ,stat,statm,maps,mem} take
+    // general_lock, check task->mm, then read through task->mem holding only
+    // mem->lock as a READER. exec already swaps the mm under general_lock for
+    // exactly this reason (exec.c: "otherwise procfs might read the pointer
+    // before it's released and then try to lock it after it's released");
+    // do_exit did not, and never cleared task->mem at all. So a `ps` reading
+    // our entry could take mem->lock the instant mem_destroy unlocked it —
+    // pthread_rwlock_destroy returns EBUSY and wrlock_destroy traps (the
+    // mem_destroy+352 `brk #1` caught on device 2026-09-19) — or touch the
+    // freed mem (EXC_BAD_ACCESS at 0x38 = offsetof(struct mem, lock)). Both
+    // reproduce natively in under a second with a fork storm plus concurrent
+    // /proc readers (tests/regress/regress_proc_exit_race.sh).
+    //
+    // Publish "no memory" under general_lock FIRST, then destroy OUTSIDE it: a
+    // reader that got in before us holds general_lock for its whole read, so
+    // we cannot reach the destroy until it is done; a reader that comes after
+    // sees NULL and returns ESRCH-ish. Never destroy under general_lock —
+    // mem_destroy closes fds and may take other locks.
     if (current->mm != NULL) {
-        mm_release(current->mm);
+        lock(&current->general_lock);
+        struct mm *mm = current->mm;
         current->mm = NULL;
+        current->mem = NULL;
+        unlock(&current->general_lock);
+        mm_release_from(mm, "do_exit");
         // [T-ish-mm-leak-refcount-handoff] We just released it, so the pthread
         // cleanup handler must NOT release again.
         current->mm_release_deferred = false;
@@ -224,6 +255,10 @@ noreturn void do_exit_group(int status) {
     { extern void dump_block_prof(void);
       static int bp_dumped = 0;
       if (!bp_dumped && current && current->pid == 1) { bp_dumped = 1; dump_block_prof(); } }
+#ifdef ISH_JIT
+    { static int jit_reported = 0;
+      if (!jit_reported && current && current->pid == 1) { jit_reported = 1; jit_report(); } }
+#endif
     // Leaked thread woke up after group already exited — bail silently.
     if (current->exiting) {
         current = NULL;
@@ -262,19 +297,43 @@ noreturn void do_exit_group(int status) {
         // Poll the thread count until only current thread remains
         int max_wait_ms = 500 + thread_count * 10;  // Scale with thread count
         if (max_wait_ms > 5000) max_wait_ms = 5000;  // Cap at 5s
+        // [T-ish-exit-valve-poll-floor] A thread waiting in poll_wait/epoll
+        // notices doing_group_exit at the latest on its next bounded host
+        // wakeup, which is up to 1 s away (fs/poll.c bounded_timeout) when the
+        // SIGUSR1 kick is missed. A budget under that orphans healthy threads:
+        // on an iPhone 11 stress run, 12418 of 12447 "stuck" threads the valve
+        // leaked went on to exit by themselves - each leak still costing a pid
+        // slot (a leaked task is never removed from the pid table) and racing
+        // the valve's fdtable_release (sys_epoll_ctl faults on freed members).
+        if (max_wait_ms < 1500) max_wait_ms = 1500;
         int wait_interval_ms = 10;  // Check every 10ms
         int waited_ms = 0;
         int last_remaining = -1;
 
-        while (waited_ms < max_wait_ms) {
+        // [T-ish-exit-valve-progress] Threads that have already entered
+        // do_exit are not stuck: they leave the group as soon as they get
+        // pids_lock, which many processes exiting at once (several agent
+        // shells, a Go program's dozen threads each) can keep busy for well
+        // over max_wait_ms. Leaking them there - unlinking a thread from its
+        // group and freeing its sighand/files while it is mid-do_exit and
+        // about to touch both - is what set up the 2026-10-14 pids_lock wedge
+        // (an iPhone 11 stress run leaked every thread of every child: "12
+        // stuck threads"). So keep waiting while every remaining thread is
+        // exiting, up to EXIT_PROGRESS_CAP_MS.
+        const int EXIT_PROGRESS_CAP_MS = 30000;
+        while (true) {
             lock(&pids_lock);
             lock(&group->lock);
 
-            // Count threads still in the group (excluding current)
+            // Count threads still in the group (excluding current), and how
+            // many of them are already on their way out.
             int remaining = 0;
+            int exiting_now = 0;
             list_for_each_entry(&group->threads, task, group_links) {
                 if (task != current) {
                     remaining++;
+                    if (atomic_load(&task->exit_started))
+                        exiting_now++;
                 }
             }
 
@@ -286,6 +345,10 @@ noreturn void do_exit_group(int status) {
             if (remaining == 0) {
                 break;
             }
+            if (waited_ms >= max_wait_ms &&
+                    (exiting_now < remaining || waited_ms >= EXIT_PROGRESS_CAP_MS)) {
+                break;
+            }
 
             // Sleep a bit to let threads exit
             struct timespec ts = {0, wait_interval_ms * 1000000L};
@@ -293,7 +356,9 @@ noreturn void do_exit_group(int status) {
             waited_ms += wait_interval_ms;
         }
 
-        if (waited_ms >= max_wait_ms) {
+        // Some thread is still in the group after the wait: either stuck
+        // outside do_exit, or still exiting when EXIT_PROGRESS_CAP_MS ran out.
+        if (last_remaining > 0) {
             // Threads are stuck in blocking syscalls and won't exit.
             if (ish_exec_trace())
                 printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
@@ -330,7 +395,11 @@ noreturn void do_exit_group(int status) {
             int leaked = 0;
             struct task *task_tmp;
             list_for_each_entry_safe(&group->threads, task, task_tmp, group_links) {
-                if (task != current && !task->exiting) {
+                // [T-ish-exit-valve-progress] Never orphan a thread that is
+                // already inside do_exit unless it outlasted the cap: it is
+                // about to touch its group and sighand, which must stay alive.
+                if (task != current && !task->exiting &&
+                        (!atomic_load(&task->exit_started) || waited_ms >= EXIT_PROGRESS_CAP_MS)) {
                     task->exiting = true;
                     list_remove(&task->group_links);
                     // Release resources so pipes get EOF and memory is freed.
@@ -355,6 +424,11 @@ noreturn void do_exit_group(int status) {
                     // unblocks and re-enters do_exit(), that mm_release()s and
                     // clears the flag, so cleanup won't double-free.
                     task->mm_release_deferred = true;
+                    // [T-ish-mm-diag] Unconditional (not exec-trace gated): one
+                    // line per leaked thread, once — the flag above is set once.
+                    printk("[iSH][SAFETY-VALVE] tid=%d (group pid=%d) marked mm_release_deferred, mm=%p refcount=%u\n",
+                           task->pid, current->pid, (void *) task->mm,
+                           task->mm ? (unsigned) task->mm->refcount : 0u);
                     if (task->files != NULL) {
                         fdtable_release(task->files);
                         task->files = NULL;
@@ -368,8 +442,10 @@ noreturn void do_exit_group(int status) {
             }
             unlock(&group->lock);
             unlock(&pids_lock);
-            if (leaked > 0 && ish_exec_trace())
-                printk("SAFETY-VALVE[exit]: pid=%d leaked %d stuck host threads\n",
+            // [T-ish-mm-diag] Unconditional: do_exit_group runs once per
+            // process, so this is at most one line per exiting process.
+            if (leaked > 0)
+                printk("[iSH][SAFETY-VALVE] pid=%d leaked %d stuck threads, mm_release deferred\n",
                        current->pid, leaked);
         } else {
 
@@ -513,6 +589,7 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     task_leave_session(task);
     list_remove(&task->group->pgroup);
     free(task->group);
+    atomic_fetch_sub_explicit(&ish_live_guest_procs, 1, memory_order_relaxed);   // [T-ish-freeze-watch]
 
     task_destroy(task);
     return true;
@@ -560,6 +637,10 @@ int do_wait(int idtype, pid_t_ id, struct siginfo_ *info, struct rusage_ *rusage
     lock(&pids_lock);
     int err;
     bool got_signal = false;
+    // [T-ish-waitpid-backoff] Seconds to wait on the next fruitless expiry.
+    // Local, so each waiter backs off independently.
+    time_t wait_backoff_s = 1;
+    static const time_t WAIT_BACKOFF_MAX_S = 4;
 
 retry:
     ;
@@ -576,6 +657,9 @@ retry:
                     continue;
                 no_children = false;
                 info->child.pid = task->pid;
+                // Must be read before reap_if_needed: reaping runs
+                // task_destroy, which memsets the task struct.
+                info->child.uid = task->uid;
                 if (reap_if_needed(task, info, rusage, options))
                     goto found_something;
             }
@@ -592,13 +676,16 @@ retry:
             goto error;
         task = task->group->leader;
         info->child.pid = id;
+        info->child.uid = task->uid;
         if (reap_if_needed(task, info, rusage, options))
             goto found_something;
     }
 
     // WNOHANG leaves the info in an implementation-defined state. set the pid
-    // to 0 so wait4 can pass that along correctly.
+    // to 0 so wait4 can pass that along correctly. Clear uid alongside it so a
+    // "no child ready" result doesn't report the uid of a candidate we scanned.
     info->child.pid = 0;
+    info->child.uid = 0;
     if (options & WNOHANG_) {
         info->sig = SIGCHLD_;
         goto found_something;
@@ -609,18 +696,69 @@ retry:
         goto error;
 
     // no matching zombie found, wait for one.
-    // Use a bounded 1-second timeout to work around macOS condvar issues
+    // Use a bounded timeout to work around macOS condvar issues
     // (pthread_cond_wait can block forever under thread contention).
+    //
+    // [T-ish-waitpid-backoff] The timeout BACKS OFF on consecutive fruitless
+    // expiries: 1s, 2s, then 4s. It is a failsafe for a missed wakeup, not
+    // the delivery path — a child that exits calls notify() on child_exit
+    // (a pthread_cond_broadcast, exit.c), so a normal reap is immediate no
+    // matter what this value is. What the timeout costs is lock traffic: the
+    // wait re-acquires the GLOBAL pids_lock to return, then `goto retry`
+    // rescans the task list under it. A child that hangs without exiting
+    // therefore made its parent grab that lock once a second forever.
+    //
+    // That is what killed the app on 2026-08-23 20:11: a wedged `ssh` idled
+    // 520s, its parent took pids_lock ~520 times, and everything else that
+    // needs it — fork, exit, SIGINT delivery, and the terminal's mount on the
+    // MAIN THREAD — queued behind it until the 10s scene-update watchdog
+    // fired. Backing off cuts those 520 acquisitions to ~132.
+    //
+    // Capped at 4s, deliberately BELOW iOS's 10s watchdog: this timeout is
+    // the only thing that detects a genuinely missed wakeup, and a cap at or
+    // above the watchdog would let one such miss stall a main-thread waiter
+    // long enough to become the very crash this is meant to prevent. Two
+    // ticks still fit inside one watchdog budget.
+    //
+    // Reset to 1s on ANY progress (see below), so a shell reaping a series of
+    // children keeps full responsiveness instead of drifting into a slow
+    // poll. Only CONSECUTIVE empty expiries back off.
+    //
+    // The counter is a local, and child_exit is per-tgroup (task.h), so each
+    // waiter backs off independently — one process's backoff cannot delay
+    // another's reap.
     current->blocking = true;
     {
-        struct timespec waitpid_timeout = {.tv_sec = 1, .tv_nsec = 0};
-        // Only a pending signal may turn into EINTR; the bounded wait timing
-        // out (_ETIMEDOUT) just means "poll again".
-        if (wait_for(&current->group->child_exit, &pids_lock, &waitpid_timeout) == _EINTR) {
+        struct timespec waitpid_timeout = {.tv_sec = wait_backoff_s, .tv_nsec = 0};
+        // wait_for returns _EINTR (signal), _ETIMEDOUT (deadline expired), or
+        // 0 (child_exit was signalled). Only a real signal may set got_signal:
+        // treating _ETIMEDOUT as one made every wait for a child that ran
+        // longer than the timeout fail with EINTR, which broke gcc (cc1 easily
+        // exceeds 1s under emulation) and every other fork+wait caller.
+        // On _ETIMEDOUT and 0 alike we just fall through to retry, which
+        // rescans for a zombie and reaps it if the child has since exited.
+        int wait_err = wait_for(&current->group->child_exit, &pids_lock, &waitpid_timeout);
+        if (wait_err == _EINTR)
             got_signal = true;
+        if (wait_err == _ETIMEDOUT) {
+            // Nothing happened — this waiter is polling a child that has not
+            // exited. Back off so it stops hammering pids_lock.
+            if (wait_backoff_s < WAIT_BACKOFF_MAX_S)
+                wait_backoff_s *= 2;
+        } else {
+            // child_exit fired (or a signal arrived): something changed, so
+            // the next wait starts responsive again.
+            wait_backoff_s = 1;
         }
     }
     current->blocking = false;
+    // [T-ish-leaked-thread-poll] Same hazard as poll_wait: a thread leaked by
+    // do_exit_group's safety valve while it slept here would go on to rescan
+    // current->group (freed) with pids_lock held. Bail out; `error` unlocks.
+    if (task_orphaned(current)) {
+        err = _EINTR;
+        goto error;
+    }
     {
         // Update last_progress_ns: waitpid is actively polling for a child,
         // this is real work (not a stuck thread). Prevents the poll_wait
@@ -644,12 +782,50 @@ error:
     return err;
 }
 
+// Convert the raw wait(2) status word that do_wait produces into the
+// (si_code, si_status) pair waitid(2) is specified to return. The encodings
+// come from the places that write child.status:
+//   sys_exit/sys_exit_group  do_exit(status << 8)   -> low byte 0
+//   deliver SIGNAL_KILL      do_exit_group(sig)     -> low byte is the signal
+//   deliver SIGNAL_STOP      sig << 8 | 0x7f
+//   ptrace stop              signal << 8 | 0x7f
+// Nothing in iSH sets the 0x80 core-dump bit today, so CLD_DUMPED is
+// unreachable in practice; it is handled anyway so this stays correct if
+// core dumps are ever implemented.
+static void waitid_decode_status(struct siginfo_ *info) {
+    dword_t status = info->child.status;
+    info->sig = SIGCHLD_;
+    if ((status & 0xff) == 0x7f) {
+        // stopped: WIFSTOPPED, signal in the high byte
+        info->code = CLD_STOPPED_;
+        info->child.status = (status >> 8) & 0xff;
+    } else if (status == 0xffff) {
+        // continued: WIFCONTINUED. Nothing produces this yet (SIGCONT does not
+        // set group_exit_code), but decode it so the case is not silently
+        // misreported as an exit if WCONTINUED support lands.
+        info->code = CLD_CONTINUED_;
+        info->child.status = SIGCONT_;
+    } else if ((status & 0x7f) != 0) {
+        // terminated by a signal: WIFSIGNALED, signal in the low 7 bits
+        info->code = (status & 0x80) ? CLD_DUMPED_ : CLD_KILLED_;
+        info->child.status = status & 0x7f;
+    } else {
+        // normal exit: WIFEXITED, exit code in the high byte
+        info->code = CLD_EXITED_;
+        info->child.status = (status >> 8) & 0xff;
+    }
+}
+
 dword_t sys_waitid(int_t idtype, pid_t_ id, addr_t info_addr, int_t options) {
     STRACE("waitid(%d, %d, %#x, %#x)", idtype, id, info_addr, options);
     struct siginfo_ info = {};
     int_t res = do_wait(idtype, id, &info, NULL, options);
     if (res < 0 || (res == 0 && info.child.pid == 0))
         return res;
+    // do_wait hands back the raw wait(2)-encoded status, which is what wait4
+    // wants but not what waitid does: waitid must report the decoded value in
+    // si_status and say which kind of event it was in si_code.
+    waitid_decode_status(&info);
     if (info_addr != 0 && user_put(info_addr, info))
         return _EFAULT;
     return 0;

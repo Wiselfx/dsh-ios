@@ -20,7 +20,7 @@
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/iOS%20%7C%20iPadOS-16%2B-blue">
-  <img alt="Guest" src="https://img.shields.io/badge/guest-Alpine%203.21%20%C2%B7%20Node%2022%20%C2%B7%20dsh%200.1-1f6feb">
+  <img alt="Guest" src="https://img.shields.io/badge/guest-Alpine%203.23%20%C2%B7%20Node%2024%20%C2%B7%20dsh%200.2.2-rc.1-1f6feb">
   <img alt="Tests" src="https://img.shields.io/badge/tests-emu%20%C2%B7%20rootfs%20%C2%B7%20XCTest%20%C2%B7%20XCUITest-success">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-green"></a>
 </p>
@@ -30,7 +30,7 @@
 > 也不会继续发布新版本。如需体验，请自行下载源码并构建运行。
 
 DSH 是一个原生 iOS app：它内嵌 [iSH-ARM64](ish-arm64) 用户态 Linux 模拟器，启动内置的
-Alpine Linux 镜像（含 Node.js 22 和 `@deepseek-ai/dsh`），托管 `dsh web` 进程，并在
+Alpine Linux 镜像（含 Node.js 24 和 `@deepseek-ai/dsh`），托管 `dsh web` 进程，并在
 `WKWebView` 里显示 harness 自己的 Web 界面。Agent 循环、会话、工具、shell 全部在设备本地
 运行；模型请求使用 harness 中配置的标准 DeepSeek API。
 
@@ -55,7 +55,7 @@ Alpine Linux 镜像（含 Node.js 22 和 `@deepseek-ai/dsh`），托管 `dsh web
 
 ## 特性
 
-- **标准 DeepSeek API**——Alpine 3.21、Node 22 和 dsh 都在 app 内运行；模型推理使用 DeepSeek API，API key 由 harness 管理。
+- **标准 DeepSeek API**——Alpine 3.23、Node 24 和 dsh 都在 app 内运行；模型推理使用 DeepSeek API，API key 由 harness 管理。
 - **原汁原味的 harness 界面**——dsh 自己的 Web 应用通过本机回环端口提供：会话、工作区、工具、权限预设、设置。
 - **随时可用的 shell**——DSH 状态栏的 `>_` 打开同一 guest 里的 Alpine 终端（`apk add`、`npm i -g`、查看 `~/.dsh`）；`⋯` 菜单提供 重新加载 / 服务日志 / 重启 Harness / 在 Safari 打开 / 关于。
 - **受监督的服务进程**——自动选择空闲端口、HTTP 就绪探测、崩溃退避重启、回到前台时健康检查、启动页实时日志。
@@ -73,7 +73,7 @@ Alpine Linux 镜像（含 Node.js 22 和 `@deepseek-ai/dsh`），托管 `dsh web
 ```bash
 git clone https://github.com/everettjf/dsh-ios.git && cd dsh-ios
 make emulator        # 构建 iSH-ARM64 命令行版 + fakefsify（用于构建和测试 guest 镜像）
-make rootfs          # build/root.tar.gz —— Alpine + Node 22 + dsh（约 95 MB，约 6 分钟，需要联网）
+make rootfs          # build/root.tar.gz —— Alpine + Node 24 + dsh（约 95 MB，约 6 分钟，需要联网）
 open DSH.xcodeproj   # 选 DSH scheme → 你的 iPad → 设置 team → Run
 ```
 
@@ -94,7 +94,7 @@ make run TEAM=XXXXXXXXXX DEVICE=<udid>   # 构建、签名、安装、启动到 
 │         │                                        ▲                │
 │  DSHHarness  (选端口 · 就绪探测 · 重启 · 健康检查)                │
 │         │  ISHShellExecutor                      │ 回环           │
-│  ┌──────▼──── iSH-ARM64 模拟器 (Alpine 3.21 aarch64) ─────────┐   │
+│  ┌──────▼──── iSH-ARM64 模拟器 (Alpine 3.23 aarch64) ─────────┐   │
 │  │  /usr/local/bin/dsh-serve                                  │   │
 │  │    → node --expose-internals @deepseek-ai/dsh web          │   │
 │  │        --host 127.0.0.1 --port N  ─────────────────────────┘   │
@@ -115,15 +115,16 @@ make run TEAM=XXXXXXXXXX DEVICE=<udid>   # 构建、签名、安装、启动到 
 
 ### 对模拟器的改动（`ish-arm64`，vendored 自 OpenMinis/ish-arm64）
 
+vendored 副本已同步到上游 `c5c264d`（2026-10-15）。本 fork 最初自带的 `FCVTL/FCVTL2`、`FCVTN/FCVTN2`、`FCVTXN/FCVTXN2` gadget、`FMOV (scalar, immediate)` 修复和 `waitpid()` EINTR 修复已在上游合入（#22、#29），不再是本地补丁。
+
 | 改动 | 原因 |
 |---|---|
-| 新增 `FCVTL/FCVTL2`、`FCVTN/FCVTN2`、`FCVTXN/FCVTXN2` 及向量定点转换 `SCVTF/UCVTF/FCVTZS/FCVTZU #fbits` gadget | libvips（dsh 图片附件插件 `sharp` 用到）会在这些指令上触发非法指令 |
-| 修复 `FMOV (scalar, immediate)` 解码 | imm8 的 bit 6 未取反，`2.25`、`31.0` 这类常量在 guest 里全部算错 |
-| `waitpid()` 不再在 1 秒有界等待超时时误返回 `EINTR` | 曾导致 gcc/g++（`failed to get exit status`）、node-gyp 以及任何等待子进程超过 1 秒的程序失败 |
-| 返回真实 `Response` 对象的流式 `fetch()` polyfill（`app/RootfsPatch.bundle`） | undici 的 LLM 流式（SSE）需要 WebAssembly，而 jitless V8 没有 |
+| 向量定点转换 `SCVTF/UCVTF/FCVTZS/FCVTZU #fbits` gadget（仍为 DSH 本地补丁） | libvips（dsh 图片附件插件 `sharp` 用到）会在这些指令上触发非法指令 |
+| `uname()` 的主机名拷贝改用 `snprintf` 限界 | 宿主 nodename 超过 64 字节时，启用 fortify 的 libc `stpcpy` 会直接终止进程（CI runner 上可见） |
+| 流式 `fetch()` polyfill（`app/RootfsPatch.bundle`，现为上游的 undici global dispatcher，version 6） | undici 的 LLM 流式（SSE）需要 WebAssembly，而 jitless V8 没有 |
 | `ISHShellExecutor` 返回 shell 退出码并在进程退出后排空管道；`ContainerURL()` 在没有 app group 时回退；部署目标 15.0 | app 集成需要 |
 
-vendored 副本的上游 commit 记录在 [`ish-arm64/UPSTREAM.md`](ish-arm64/UPSTREAM.md)；这些修复相互独立，欢迎回馈上游。
+vendored 副本的上游 commit 记录在 [`ish-arm64/UPSTREAM.md`](ish-arm64/UPSTREAM.md)。注意 dsh ≥ 0.2.x 的 web UI 现在需要每次进程随机生成的 token（`dsh web` 启动时打印 `http://127.0.0.1:<port>/?token=…`）；`DSHHarness` 会从 guest 输出中捕获该 URL 并交给 web view 加载，就绪探测把低于 500 的任何 HTTP 应答都视为存活。
 
 ## 测试
 

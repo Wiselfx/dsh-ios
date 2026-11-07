@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DSH — DeepSeek Harness on iPad &amp; iPhone</title>
-<meta name="description" content="DSH runs DeepSeek Harness entirely on your iPad or iPhone: an embedded iSH-ARM64 Linux emulator boots Alpine + Node 22 + dsh and shows the harness web UI in the app. No jailbreak, no server.">
+<meta name="description" content="DSH runs DeepSeek Harness entirely on your iPad or iPhone: an embedded iSH-ARM64 Linux emulator boots Alpine + Node 24 + dsh and shows the harness web UI in the app. No jailbreak, no server.">
 <meta property="og:title" content="DSH — DeepSeek Harness on iPad & iPhone">
 <meta property="og:description" content="Run DeepSeek Harness fully on-device. Open source, GPL-3.0.">
 <meta property="og:image" content="img/ipad-air-workspace.png">
@@ -57,7 +57,7 @@
   <div class="wrap">
     <img class="icon" src="img/icon.png" alt="DSH app icon">
     <h1><code>dsh-ios</code> — DeepSeek Harness on iPad &amp; iPhone</h1>
-    <p class="tag">Run <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> entirely on your device. A native iOS app embeds the iSH‑ARM64 Linux emulator, boots Alpine + Node 22 + <code>dsh</code>, and shows the harness's own web UI. No jailbreak, no server, no Mac in the loop.</p>
+    <p class="tag">Run <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> entirely on your device. A native iOS app embeds the iSH‑ARM64 Linux emulator, boots Alpine + Node 24 + <code>dsh</code>, and shows the harness's own web UI. No jailbreak, no server, no Mac in the loop.</p>
     <div class="cta">
       <a class="primary" href="https://github.com/everettjf/dsh-ios">View on GitHub</a>
       <a class="ghost" href="https://github.com/everettjf/dsh-ios#quick-start">Build it yourself</a>
@@ -73,7 +73,7 @@
 <section id="features"><div class="wrap">
   <h2>What you get</h2>
   <div class="grid">
-    <div class="card"><h3>Fully on‑device</h3><p>Alpine 3.21 (aarch64), Node.js 22 and <code>@deepseek-ai/dsh</code> run inside the app in the iSH‑ARM64 userspace emulator. Only model API calls leave the device.</p></div>
+    <div class="card"><h3>Fully on‑device</h3><p>Alpine 3.23 (aarch64), Node.js 24 and <code>@deepseek-ai/dsh</code> run inside the app in the iSH‑ARM64 userspace emulator. Only model API calls leave the device.</p></div>
     <div class="card"><h3>The real harness UI</h3><p>A <code>WKWebView</code> shows dsh's own web app served on loopback — sessions, workspaces, tools, permission presets, everything.</p></div>
     <div class="card"><h3>A shell when you want one</h3><p>The <code>&gt;_</code> button opens an Alpine terminal in the same guest: <code>apk add</code>, <code>npm i -g</code>, poke at <code>~/.dsh</code>.</p></div>
     <div class="card"><h3>Supervised server</h3><p>Free‑port selection, HTTP readiness probe, crash restart with back‑off, foreground health check, live log tail on the startup overlay.</p></div>
@@ -89,7 +89,7 @@
 │         │                                        ▲                │
 │  DSHHarness  (port pick · readiness probe · restart · health)     │
 │         │  ISHShellExecutor                      │ loopback       │
-│  ┌──────▼──── iSH-ARM64 emulator (Alpine 3.21 aarch64) ───────┐   │
+│  ┌──────▼──── iSH-ARM64 emulator (Alpine 3.23 aarch64) ───────┐   │
 │  │  /usr/local/bin/dsh-serve                                  │   │
 │  │    → node --expose-internals @deepseek-ai/dsh web          │   │
 │  │        --host 127.0.0.1 --port N  ─────────────────────────┘   │
@@ -103,7 +103,7 @@
 <pre><span class="c"># macOS on Apple Silicon, Xcode 26/27, brew install meson ninja, Node ≥ 20, gem install xcodeproj</span>
 git clone git@github.com:everettjf/dsh-ios.git &amp;&amp; cd dsh-ios
 make emulator        <span class="c"># iSH-ARM64 CLI + fakefsify</span>
-make rootfs          <span class="c"># build/root.tar.gz — Alpine + Node 22 + dsh (~95 MB, ~6 min)</span>
+make rootfs          <span class="c"># build/root.tar.gz — Alpine + Node 24 + dsh (~95 MB, ~6 min)</span>
 open DSH.xcodeproj   <span class="c"># DSH scheme → your iPad → Run   (or: make run TEAM=… DEVICE=…)</span>
 make test            <span class="c"># emulator + rootfs + XCTest/XCUITest on the simulator, unattended</span></pre>
   <table>

@@ -44,7 +44,7 @@ one extra plugin through the profile patch we already ship in
 │    ├── GET  /v1/health/steps?days=7      ← HealthKit               │  │
 │    └── …one route per capability                                   │  │
 │         ▲ Bearer <token>                                           │  │
-│  ┌──────┴──────── iSH-ARM64 guest (Alpine + Node 22 + dsh) ────────▼┐ │
+│  ┌──────┴──────── iSH-ARM64 guest (Alpine + Node 24 + dsh) ────────▼┐ │
 │  │  dsh-host-bridge plugin → tools: health_query, device_info, …    │ │
 │  │  dsh web ────────────────────────────────────────────────────────┘ │
 │  └──────────────────────────────────────────────────────────────────┘ │

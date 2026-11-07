@@ -10,24 +10,338 @@
 #include "fs/inode.h"
 #include "fs/path.h"
 #include "fs/real.h"
+
+// TRACE() in this file routes to the `verbose` channel (debug.h's default),
+// i.e. compiled out unless DEBUG_verbose is set.
+#define DEFAULT_CHANNEL verbose
 #include "fs/sock.h"
+#include "fs/netlink.h"
 #include "debug.h"
 
 #define SOCKET_TYPE_MASK 0xf
 
 const struct fd_ops socket_fdops;
 
+// ---------------------------------------------------------------------------
+// AF_NETLINK stub -- the socket half. fs/netlink.c is the other half: it
+// turns a request into reply datagrams.
+//
+// Darwin has no AF_NETLINK and there is no Linux network stack under the
+// guest, so nothing is forwarded. A netlink fd is a host socketpair whose
+// far end this file writes replies into, which gives poll/epoll/close and
+// refcounting for free. The rules it keeps:
+//
+//   * Every request is answered when it is SENT -- by write(), writev(),
+//     send(), sendto() or sendmsg() alike -- so a reply is already queued by
+//     the time the guest reads. (The stub used to answer only sendto and
+//     sendmsg: busybox `ip` sends with write() and then waited for ever.)
+//   * What the host can tell us is real: RTM_GETLINK and RTM_GETADDR come
+//     from getifaddrs(). What it cannot (routes, rules, neighbours, any
+//     change, any protocol but NETLINK_ROUTE) is refused with NLMSG_ERROR at
+//     once. Nothing is left unanswered.
+//   * A read never blocks without bound. MSG_PEEK, MSG_TRUNC, MSG_DONTWAIT
+//     and O_NONBLOCK mean what they mean on Linux; an empty queue is EAGAIN
+//     for a non-blocking reader, and a blocking reader waits in bounded
+//     polls so a guest signal always gets through. A socket bound to
+//     multicast groups (ip monitor, Go's netmon) waits the same way: no
+//     event is ever delivered, exactly as on a Linux box where nothing
+//     changes.
+//
+// On by default; ISH_NETLINK_STUB=0 disables it at runtime (AF_NETLINK is
+// then EAFNOSUPPORT). ISH_NETLINK_ROUTE=empty answers a route dump with an
+// empty dump instead of EOPNOTSUPP.
+// ---------------------------------------------------------------------------
+
+#define AF_NETLINK_ 16
+#define NETLINK_ROUTE_ 0
+
+// nlmsghdr, as the guest (Linux/arm64) sees it. Same layout on all Linux
+// arches: 16 bytes, 4-byte aligned.
+struct nlmsghdr_ {
+    uint32_t nlmsg_len;
+    uint16_t nlmsg_type;
+    uint16_t nlmsg_flags;
+    uint32_t nlmsg_seq;
+    uint32_t nlmsg_pid;
+};
+#define NLMSG_NOOP_  1
+#define NLMSG_ERROR_ 2
+#define NLMSG_DONE_  3
+#define NLMSG_ALIGN_(len) (((len) + 3) & ~3u)
+
+// sockaddr_nl as the guest sees it (12 bytes on all Linux arches).
+struct sockaddr_nl_ {
+    uint16_t nl_family;
+    uint16_t nl_pad;
+    uint32_t nl_pid;
+    uint32_t nl_groups;
+};
+
+bool ish_netlink_stub_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        // Built in and on by default (tailscale / tsnet die at startup on
+        // EAFNOSUPPORT otherwise); ISH_NETLINK_STUB=0 turns it off.
+        const char *v = getenv("ISH_NETLINK_STUB");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+// One line per kind of event for the life of the process, not one per call:
+// the stub sits on paths Go programs hit in a loop.
+static void netlink_stub_log_once(int *flag, const char *what, unsigned type, unsigned seq) {
+    if (__sync_bool_compare_and_swap(flag, 0, 1))
+        printk("NETLINK_STUB %s (pid=%d comm=%s type=%u seq=%u; logged once)\n",
+               what, current->pid, current->comm, type, seq);
+}
+
+struct netlink_emit_ctx {
+    struct fd *fd;
+    bool overflow;
+    bool refused;
+    unsigned count;
+};
+
+// Queue one reply datagram into the socketpair. The far end is
+// non-blocking: a full queue is recorded, never waited on.
+static int netlink_stub_emit(void *opaque, const void *dgram, size_t len) {
+    struct netlink_emit_ctx *ctx = opaque;
+    int peer = ctx->fd->socket.netlink_peer_fd;
+    if (peer < 0)
+        return _EINVAL;
+    if (len >= 20 && ((const struct nlmsghdr_ *) dgram)->nlmsg_type == NLMSG_ERROR_ &&
+            ((const int32_t *) dgram)[4] != 0)
+        ctx->refused = true;
+    for (;;) {
+        ssize_t w = send(peer, dgram, len, MSG_DONTWAIT);
+        if (w >= 0) {
+            ctx->count++;
+            return 0;
+        }
+        if (errno == EINTR)
+            continue;
+        ctx->overflow = true;
+        return _ENOBUFS;
+    }
+}
+
+// Answer a request the guest just sent (by whatever syscall). Returns
+// req_len: as on Linux, sending a request succeeds whatever its answer is.
+static int netlink_stub_reply(struct fd *fd, const void *req, size_t req_len) {
+    static int logged_answer, logged_refuse, logged_overflow;
+    struct netlink_emit_ctx ctx = {.fd = fd};
+    struct netlink_stub_req last = {0};
+    netlink_stub_answer(fd->socket.protocol, req, req_len, netlink_stub_emit, &ctx, &last);
+
+    lock(&fd->lock);
+    // A dump that did not fit the queue still has to end: the reader is
+    // owed an NLMSG_DONE, handed over when it finds the queue empty.
+    fd->socket.netlink_owe_done = ctx.overflow && last.valid;
+    fd->socket.netlink_owe_seq = last.seq;
+    unlock(&fd->lock);
+
+    if (ctx.overflow)
+        netlink_stub_log_once(&logged_overflow, "reply queue full, dump cut short", last.type, last.seq);
+    else if (ctx.refused)
+        netlink_stub_log_once(&logged_refuse, "request refused with NLMSG_ERROR (not available on this host)", last.type, last.seq);
+    else if (ctx.count > 0)
+        netlink_stub_log_once(&logged_answer, "answered from the host's interfaces", last.type, last.seq);
+    TRACE("NETLINK_STUB request type=%u seq=%u flags=%#x -> %u datagram(s)%s%s\n",
+          last.type, last.seq, last.flags, ctx.count,
+          ctx.refused ? " (refused)" : "", ctx.overflow ? " (queue full)" : "");
+    return (int) req_len;
+}
+
+static int netlink_stub_sendmsg(struct fd *sock, addr_t msghdr_addr) {
+    addr_t iov_addr; uint64_t iovlen;
+#ifdef GUEST_ARM64
+    struct msghdr64_ m;
+    if (user_get(msghdr_addr, m)) return _EFAULT;
+    iov_addr = (addr_t) m.msg_iov; iovlen = m.msg_iovlen;
+#else
+    struct msghdr_ m;
+    if (user_get(msghdr_addr, m)) return _EFAULT;
+    iov_addr = m.msg_iov; iovlen = m.msg_iovlen;
+#endif
+    char req[4096]; size_t total = 0;
+    for (uint64_t i = 0; i < iovlen && total < sizeof(req); i++) {
+        struct iovec64_ iv;
+        if (user_get(iov_addr + i * sizeof(iv), iv)) return _EFAULT;
+        size_t n = (size_t) iv.len;
+        if (n > sizeof(req) - total) n = sizeof(req) - total;
+        if (n && user_read((addr_t) iv.base, req + total, n)) return _EFAULT;
+        total += n;
+    }
+    int r = netlink_stub_reply(sock, req, total);
+    return r < 0 ? r : (int) total;
+}
+
+static long monotonic_ms(void);
+
+// Take (or with MSG_PEEK_, look at) the next reply datagram. Returns its
+// full length, which may exceed `cap`, or a negative errno. Never blocks
+// without bound:
+//   * a queued datagram is returned at once;
+//   * an empty queue with a dump still owed its end yields that NLMSG_DONE;
+//   * an empty queue is _EAGAIN for a non-blocking reader;
+//   * a blocking reader waits in 1 s polls, checking for guest signals
+//     between them (_EINTR), until something is queued or SO_RCVTIMEO runs
+//     out.
+static ssize_t netlink_stub_dequeue(struct fd *sock, int guest_flags, char *buf, size_t cap) {
+    static int logged_owed, logged_wait;
+    int host_flags = MSG_DONTWAIT | ((guest_flags & MSG_PEEK_) ? MSG_PEEK : 0);
+    int fl = fcntl(sock->real_fd, F_GETFL, 0);
+    bool nonblock = (guest_flags & MSG_DONTWAIT_) || (sock->flags & O_NONBLOCK_) ||
+                    (fl >= 0 && (fl & O_NONBLOCK));
+    long timeout_ms = sock->socket.netlink_rcvtimeo_ms;
+    long start_ms = monotonic_ms();
+    for (;;) {
+        ssize_t n = recv(sock->real_fd, buf, cap, host_flags);
+        if (n >= 0)
+            return n;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return errno_map();
+
+        lock(&sock->lock);
+        bool owed = sock->socket.netlink_owe_done;
+        uint32_t seq = sock->socket.netlink_owe_seq;
+        if (owed && !(guest_flags & MSG_PEEK_))
+            sock->socket.netlink_owe_done = false;
+        unlock(&sock->lock);
+        if (owed && cap >= 20) {
+            netlink_stub_log_once(&logged_owed, "empty queue with a dump unfinished: NLMSG_DONE synthesized", NLMSG_DONE_, seq);
+            return (ssize_t) netlink_stub_done(buf, seq);
+        }
+        if (nonblock)
+            return _EAGAIN;
+
+        if (current->sighand != NULL) {
+            lock(&current->sighand->lock);
+            bool pending = !!(current->pending & ~current->blocked);
+            unlock(&current->sighand->lock);
+            if (pending)
+                return _EINTR;
+        }
+        long waited = monotonic_ms() - start_ms;
+        if (timeout_ms > 0 && waited >= timeout_ms)
+            return _EAGAIN;
+        if (waited >= 3000)
+            netlink_stub_log_once(&logged_wait, "blocking read with nothing queued for 3s (no event is ever delivered)",
+                                  0, sock->socket.netlink_groups);
+        int poll_ms = 1000;
+        if (timeout_ms > 0 && timeout_ms - waited < poll_ms)
+            poll_ms = (int) (timeout_ms - waited);
+        struct pollfd pfd = {.fd = sock->real_fd, .events = POLLIN};
+        current->blocking = true;
+        poll(&pfd, 1, poll_ms);
+        current->blocking = false;
+    }
+}
+
+static int netlink_stub_recvmsg(struct fd *sock, addr_t msghdr_addr, int flags) {
+    addr_t iov_addr, name_addr; uint64_t iovlen; uint32_t namelen;
+#ifdef GUEST_ARM64
+    struct msghdr64_ m;
+    if (user_get(msghdr_addr, m)) return _EFAULT;
+    iov_addr = (addr_t) m.msg_iov; iovlen = m.msg_iovlen;
+    name_addr = (addr_t) m.msg_name; namelen = m.msg_namelen;
+#else
+    struct msghdr_ m;
+    if (user_get(msghdr_addr, m)) return _EFAULT;
+    iov_addr = m.msg_iov; iovlen = m.msg_iovlen;
+    name_addr = m.msg_name; namelen = m.msg_namelen;
+#endif
+    char buf[NETLINK_STUB_DGRAM_MAX * 2];
+    ssize_t n = netlink_stub_dequeue(sock, flags, buf, sizeof(buf));
+    if (n < 0) return (int) n;
+    size_t have_total = (size_t) n < sizeof(buf) ? (size_t) n : sizeof(buf);
+
+    size_t off = 0;
+    for (uint64_t i = 0; i < iovlen && off < have_total; i++) {
+        struct iovec64_ iv;
+        if (user_get(iov_addr + i * sizeof(iv), iv)) return _EFAULT;
+        size_t want = (size_t) iv.len, have = have_total - off;
+        if (want > have) want = have;
+        if (want && user_write((addr_t) iv.base, buf + off, want)) return _EFAULT;
+        off += want;
+    }
+    if (name_addr != 0 && namelen >= sizeof(struct sockaddr_nl_)) {
+        struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_, .nl_pad = 0,
+                                   .nl_pid = 0, .nl_groups = 0 };
+        if (user_write(name_addr, &nl, sizeof(nl))) return _EFAULT;
+        m.msg_namelen = sizeof(nl);
+    } else {
+        m.msg_namelen = 0;
+    }
+    // Written back as Linux does: who it came from, no ancillary data, and
+    // MSG_TRUNC when the datagram did not fit.
+    m.msg_controllen = 0;
+    m.msg_flags = off < (size_t) n ? MSG_TRUNC_ : 0;
+    if (user_put(msghdr_addr, m)) return _EFAULT;
+    TRACE("NETLINK_STUB recvmsg flags=%#x -> %zd bytes (%zu copied)\n", flags, n, off);
+    // With MSG_TRUNC the caller asks for the real length of the datagram.
+    return (flags & MSG_TRUNC_) ? (int) n : (int) off;
+}
+
+static fd_t netlink_stub_socket(dword_t type, dword_t protocol) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0)
+        return errno_map();
+    struct fd *fd = adhoc_fd_create(&socket_fdops);
+    if (fd == NULL) {
+        close(sv[0]);
+        close(sv[1]);
+        return _ENOMEM;
+    }
+    fd->stat.mode = S_IFSOCK | 0666;
+    fd->real_fd = sv[0];
+    fd->socket.domain = AF_NETLINK_;
+    fd->socket.type = type & SOCKET_TYPE_MASK;
+    fd->socket.protocol = protocol;
+    fd->socket.netlink_peer_fd = sv[1];
+    fd->socket.netlink_groups = 0;
+    fd->socket.netlink_owe_done = false;
+    fd->socket.netlink_owe_seq = 0;
+    fd->socket.netlink_rcvtimeo_ms = 0;
+    // A full link + address dump is queued in one go, one message per
+    // datagram, and a host AF_UNIX datagram socket holds only a few
+    // kilobytes by default. Give the queue room; if the host refuses, the
+    // dump is cut short and ended properly (netlink_owe_done).
+    int space = 512 * 1024;
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &space, sizeof(space));
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &space, sizeof(space));
+    TRACE("NETLINK_STUB socket(AF_NETLINK, %d, %d) -> stub fd\n", type, protocol);
+    // [T-ish-host-fd-double-close] A failed f_install() has closed fd, and
+    // sock_close() with it both sv[0] (real_fd) and sv[1] (netlink_peer_fd).
+    return f_install(fd, type & ~SOCKET_TYPE_MASK);
+}
+
+static bool fd_is_netlink_stub(struct fd *fd) {
+    return fd != NULL && fd->ops == &socket_fdops &&
+           fd->socket.domain == AF_NETLINK_;
+}
+
 static lock_t peer_lock = LOCK_INITIALIZER;
 
+// [T-ish-host-fd-double-close] Owns sock_fd from here on: on any failure it is
+// already closed (f_install() closes the fd it could not install, and with it
+// real_fd). Callers used to close() it again, which closes whatever the app
+// opened under that number in between.
 static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
-    if (fd == NULL)
+    if (fd == NULL) {
+        close(sock_fd);
         return _ENOMEM;
+    }
     fd->stat.mode = S_IFSOCK | 0666;
     fd->real_fd = sock_fd;
     fd->socket.domain = domain;
     fd->socket.type = type & SOCKET_TYPE_MASK;
     fd->socket.protocol = protocol;
+    fd->socket.netlink_peer_fd = -1; // [STAGE-0 PROBE] only netlink sets this
     if (domain == AF_LOCAL_) {
         cond_init(&fd->socket.unix_got_peer);
         list_init(&fd->socket.unix_scm);
@@ -37,6 +351,11 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
 
 int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     STRACE("socket(%d, %d, %d)", domain, type, protocol);
+    // [STAGE-0 PROBE] AF_NETLINK has no host equivalent (Darwin uses PF_ROUTE),
+    // so it never reaches sock_family_to_real -- it is served entirely by the
+    // stub above. On unless ISH_NETLINK_STUB=0.
+    if (domain == AF_NETLINK_ && ish_netlink_stub_enabled())
+        return netlink_stub_socket(type, protocol);
     int real_domain = sock_family_to_real(domain);
     if (real_domain < 0)
         return _EAFNOSUPPORT;
@@ -61,10 +380,7 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     }
 #endif
 
-    fd_t f = sock_fd_create(sock, domain, type, protocol);
-    if (f < 0)
-        close(sock);
-    return f;
+    return sock_fd_create(sock, domain, type, protocol);
 }
 
 static void inode_release_if_exist(struct inode_data *inode) {
@@ -335,6 +651,16 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    // netlink bind: accepted. nl_groups is remembered for the log only: no
+    // event is ever multicast, so a subscribed reader simply waits (in
+    // bounded polls, see netlink_stub_dequeue).
+    if (fd_is_netlink_stub(sock)) {
+        struct sockaddr_nl_ nl = {0};
+        if (sockaddr_len >= sizeof(nl) && user_read(sockaddr_addr, &nl, sizeof(nl)) == 0)
+            sock->socket.netlink_groups = nl.nl_groups;
+        TRACE("NETLINK_STUB bind() accepted (nl_groups=%#x, no events are delivered)\n", sock->socket.netlink_groups);
+        return 0;
+    }
     struct sockaddr_max_ sockaddr;
     struct inode_data *inode = NULL;
     int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, sock);
@@ -448,17 +774,24 @@ int_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
         return errno_map();
 
     if (sockaddr_addr != 0) {
+        // [T-ish-host-fd-double-close] Neither failure may leak the accepted
+        // host socket, and the first used to hand the HOST fd number to the
+        // guest as if it were the result.
         int err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
-        if (err < 0)
-            return client;
-        if (user_put(sockaddr_len_addr, sockaddr_len))
-            return _EFAULT;
+        if (err >= 0 && user_put(sockaddr_len_addr, sockaddr_len))
+            err = _EFAULT;
+        if (err < 0) {
+            close(client);
+            return err;
+        }
     }
 
     fd_t client_f = sock_fd_create(client,
             sock->socket.domain, sock->socket.type, sock->socket.protocol);
+    // [T-ish-host-fd-double-close] client is closed already; going on used to
+    // f_get() the negative number below and write through the NULL fd.
     if (client_f < 0)
-        close(client);
+        return client_f;
 
     if (sock->socket.domain == AF_LOCAL_) {
         lock(&peer_lock);
@@ -519,6 +852,25 @@ int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
     if (user_get(sockaddr_len_addr, sockaddr_len))
         return _EFAULT;
     char sockaddr[sockaddr_len];
+
+    // [STAGE-0 PROBE] netlink: report a sockaddr_nl. Go's netlinkrib calls
+    // getsockname() to learn the pid the kernel assigned, then matches it
+    // against nlmsg_pid on replies. Reporting the backing AF_UNIX address
+    // here is what made it fail with EINVAL. pid=0 matches the replies the
+    // stub emits (it echoes the request's pid, normally 0).
+    if (fd_is_netlink_stub(sock)) {
+        struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_, .nl_pad = 0,
+                                   .nl_pid = 0, .nl_groups = 0 };
+        dword_t out_len = sizeof(nl);
+        if (sockaddr_len < out_len)
+            out_len = sockaddr_len;
+        if (user_write(sockaddr_addr, &nl, out_len))
+            return _EFAULT;
+        if (user_put(sockaddr_len_addr, out_len))
+            return _EFAULT;
+        TRACE("NETLINK_STUB getsockname -> nl_pid=0\n");
+        return 0;
+    }
 
     // if this is a unix socket, return the same string passed to bind
     if (sock->socket.domain == PF_LOCAL_) {
@@ -581,23 +933,35 @@ int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sock
     if (err < 0)
         return errno_map();
 
-    lock(&peer_lock);
+    // [T-ish-host-fd-double-close] Each host end is closed exactly once: by
+    // sock_fd_create() when it fails, by sys_close() once it is installed,
+    // and here only while it has no guest fd yet.
+    // [T-ish-socketpair-emfile-deadlock] peer_lock is taken only to link the
+    // two ends. It used to be held across sock_fd_create(), whose failure
+    // path (f_install() -> fd_close() -> sock_close()) takes peer_lock again:
+    // a socketpair() at RLIMIT_NOFILE hung its thread forever on a
+    // non-recursive mutex, and with it every later unix socket call.
     int fake_sockets[2];
     err = fake_sockets[0] = sock_fd_create(sockets[0], domain, type, protocol);
     if (fake_sockets[0] < 0) {
-        unlock(&peer_lock);
-        goto close_sockets;
+        close(sockets[1]);
+        return err;
     }
     err = fake_sockets[1] = sock_fd_create(sockets[1], domain, type, protocol);
-    if (fake_sockets[1] < 0) {
-        unlock(&peer_lock);
+    if (fake_sockets[1] < 0)
         goto close_fake_0;
+    struct fd *sock1 = f_get_retained(fake_sockets[0]);
+    struct fd *sock2 = f_get_retained(fake_sockets[1]);
+    if (sock1 != NULL && sock2 != NULL) {
+        lock(&peer_lock);
+        sock1->socket.unix_peer = sock2;
+        sock2->socket.unix_peer = sock1;
+        unlock(&peer_lock);
     }
-    struct fd *sock1 = f_get(fake_sockets[0]);
-    struct fd *sock2 = f_get(fake_sockets[1]);
-    sock1->socket.unix_peer = sock2;
-    sock2->socket.unix_peer = sock1;
-    unlock(&peer_lock);
+    if (sock1 != NULL)
+        fd_close(sock1);
+    if (sock2 != NULL)
+        fd_close(sock2);
 
     err = _EFAULT;
     if (user_put(sockets_addr, fake_sockets))
@@ -610,9 +974,6 @@ close_fake_1:
     sys_close(fake_sockets[1]);
 close_fake_0:
     sys_close(fake_sockets[0]);
-close_sockets:
-    close(sockets[0]);
-    close(sockets[1]);
     return err;
 }
 
@@ -625,6 +986,13 @@ int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, a
         return _EFAULT;
     buffer[len] = '\0';
     STRACE("sendto(%d, \"%.100s\", %d, %d, 0x%x, %d)", sock_fd, buffer, len, flags, sockaddr_addr, sockaddr_len);
+    // A netlink request is answered as it is sent; the replies are queued
+    // for the guest's following read.
+    if (fd_is_netlink_stub(sock)) {
+        int nl = netlink_stub_reply(sock, buffer, len);
+        free(buffer);
+        return nl;
+    }
     int real_flags = sock_flags_to_real(flags);
     int err = _EINVAL;
     if (real_flags < 0)
@@ -739,6 +1107,30 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
         if (user_get(sockaddr_len_addr, sockaddr_len))
             return _EFAULT;
 
+    // recv()/recvfrom() on a netlink fd: the same bounded read as recvmsg,
+    // and the peer is reported as a sockaddr_nl (the generic path would
+    // hand back the host socketpair's AF_UNIX address).
+    if (fd_is_netlink_stub(sock)) {
+        char nlbuf[NETLINK_STUB_DGRAM_MAX * 2];
+        ssize_t n = netlink_stub_dequeue(sock, flags, nlbuf, sizeof(nlbuf));
+        if (n < 0)
+            return (int) n;
+        size_t copy = (size_t) n < sizeof(nlbuf) ? (size_t) n : sizeof(nlbuf);
+        if (copy > len)
+            copy = len;
+        if (copy && user_write(buffer_addr, nlbuf, copy))
+            return _EFAULT;
+        if (sockaddr_addr != 0 && sockaddr_len_addr != 0) {
+            struct sockaddr_nl_ nl = { .nl_family = AF_NETLINK_ };
+            if (sockaddr_len >= sizeof(nl) && user_write(sockaddr_addr, &nl, sizeof(nl)))
+                return _EFAULT;
+            uint_t out_len = sizeof(nl);
+            if (user_put(sockaddr_len_addr, out_len))
+                return _EFAULT;
+        }
+        return (flags & MSG_TRUNC_) ? (int) n : (int) copy;
+    }
+
     char *buffer = malloc(len);
     char sockaddr[sockaddr_len];
 
@@ -846,12 +1238,49 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     if (user_read(value_addr, value, value_len))
         return _EFAULT;
 
+    // A netlink fd is a host socketpair: buffer sizes and SOL_NETLINK
+    // options (iproute2 sets SO_SNDBUF/SO_RCVBUF and gives up if they fail)
+    // mean nothing to it, so they are accepted and dropped. The receive
+    // timeout is kept, for the bounded read to honour (netlink_stub_dequeue).
+    // Both of Linux's numbers for it are taken: 20 is what a 64-bit guest's
+    // libc uses, 66 the newer 64-bit-time one.
+    if (fd_is_netlink_stub(sock)) {
+        if (level == SOL_SOCKET_ && (option == 20 || option == SO_RCVTIMEO_) && value_len >= 16) {
+            int64_t sec, usec;
+            memcpy(&sec, value, 8);
+            memcpy(&usec, value + 8, 8);
+            if (sec < 0 || usec < 0 || usec >= 1000000)
+                return _EDOM;
+            sock->socket.netlink_rcvtimeo_ms = (long) (sec * 1000 + usec / 1000);
+            // A timeout below a millisecond is still a timeout.
+            if (sock->socket.netlink_rcvtimeo_ms == 0 && (sec != 0 || usec != 0))
+                sock->socket.netlink_rcvtimeo_ms = 1;
+        }
+        return 0;
+    }
+
     // ICMP6_FILTER can only be set on real SOCK_RAW
     if (level == IPPROTO_ICMPV6 && option == ICMP6_FILTER_)
         return 0;
     // IP_MTU_DISCOVER has no equivalent on Darwin
     if (level == IPPROTO_IP && option == IP_MTU_DISCOVER_)
         return 0;
+    // [STAGE-0 PROBE] SO_BINDTODEVICE: bind this socket to a named interface.
+    // iSH has no interface model at all (/proc/net/dev is hardcoded dummy
+    // data), and Darwin's nearest equivalent is IP_BOUND_IF, which takes an
+    // ifindex rather than a name. Go's netns code sets this on every outbound
+    // dial, so rejecting it makes ALL dials fail with EINVAL. Accept and
+    // ignore: with a single host network path there is nothing to choose
+    // between, so unbound behaviour is what the caller wanted anyway.
+    if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
+        // Prefix is deliberately NOT "NETLINK_STUB": this has nothing to do
+        // with netlink and is NOT covered by ISH_NETLINK_STUB, so the old
+        // name implied that disabling the stub would disable this too.
+        // TRACE, not printk: Go sets this on EVERY outbound dial, and the
+        // unconditional form produced ~512KB of log in a single proxy test.
+        TRACE("SOCKOPT SO_BINDTODEVICE ignored (no iface model)\n");
+        return 0;
+    }
     // TCP_CONGESTION also has no equivalent on Darwin
 #if defined(__APPLE__)
     if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
@@ -1004,6 +1433,8 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    if (fd_is_netlink_stub(sock))
+        return netlink_stub_sendmsg(sock, msghdr_addr);
 
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr msg;
@@ -1183,6 +1614,8 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    if (fd_is_netlink_stub(sock))
+        return netlink_stub_recvmsg(sock, msghdr_addr, flags);
 
     // Read the guest msghdr struct into our internal 32-bit representation
     struct msghdr_ msg_fake;
@@ -1490,6 +1923,19 @@ static void sock_translate_err(struct fd *fd, int *err) {
 // except "host syscall got EINTR AND guest has a pending signal", which is
 // precisely the bug we need to fix.
 static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
+    // read() on a netlink fd is recv() with no flags: bounded, never a bare
+    // blocking read() of the backing socketpair.
+    if (fd_is_netlink_stub(fd)) {
+        char nlbuf[NETLINK_STUB_DGRAM_MAX * 2];
+        ssize_t n = netlink_stub_dequeue(fd, 0, nlbuf, sizeof(nlbuf));
+        if (n < 0)
+            return n;
+        size_t copy = (size_t) n < sizeof(nlbuf) ? (size_t) n : sizeof(nlbuf);
+        if (copy > size)
+            copy = size;
+        memcpy(buf, nlbuf, copy);
+        return (ssize_t) copy;
+    }
     int err;
     int eintr_count = 0;
     for (;;) {
@@ -1517,6 +1963,11 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
 }
 
 static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
+    // write()/writev() on a netlink fd is a request like any other (busybox
+    // `ip` sends its dump requests this way): answer it, do not push the
+    // bytes into the socketpair where nobody reads them.
+    if (fd_is_netlink_stub(fd))
+        return netlink_stub_reply(fd, buf, size);
     int err;
     int eintr_count = 0;
     for (;;) {
@@ -1540,6 +1991,11 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
 }
 
 static int sock_close(struct fd *fd) {
+    // [STAGE-0 PROBE] release the stub's socketpair write end.
+    if (fd->socket.netlink_peer_fd >= 0) {
+        close(fd->socket.netlink_peer_fd);
+        fd->socket.netlink_peer_fd = -1;
+    }
     sockrestart_end_listen(fd);
     // FIXME next 3 lines should go in a function like release_unix_names
     inode_release_if_exist(fd->socket.unix_name_inode);

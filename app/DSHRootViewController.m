@@ -190,7 +190,7 @@ static NSString *const kDSHUserAgentSuffix = @" DSH-iOS/1.0";
     restart.attributes = UIMenuElementAttributesDestructive;
     UIAction *repair = [UIAction actionWithTitle:@"Repair Linux Environment" image:[UIImage systemImageNamed:@"wrench.and.screwdriver"] identifier:@"dsh.repair" handler:^(UIAction *a) { [weakSelf confirmRepair]; }];
     UIAction *safari = [UIAction actionWithTitle:@"Open in Safari" image:[UIImage systemImageNamed:@"safari"] identifier:@"dsh.safari" handler:^(UIAction *a) {
-        NSURL *url = DSHHarness.shared.baseURL;
+        NSURL *url = DSHHarness.shared.serverWebURL ?: DSHHarness.shared.baseURL;
         if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
     }];
     UIAction *about = [UIAction actionWithTitle:@"About DSH" image:[UIImage systemImageNamed:@"info.circle"] identifier:@"dsh.about" handler:^(UIAction *a) { [weakSelf presentAbout]; }];
@@ -285,7 +285,7 @@ static NSString *const kDSHUserAgentSuffix = @" DSH-iOS/1.0";
 }
 
 - (void)loadHarness {
-    NSURL *url = DSHHarness.shared.baseURL;
+    NSURL *url = DSHHarness.shared.serverWebURL ?: DSHHarness.shared.baseURL;
     if (url == nil)
         return;
     [self.overlay showStarting:@"Loading the interface…"];
@@ -476,7 +476,7 @@ static const NSTimeInterval kActivityIndicatorVisible = 6;
 #pragma mark - WKNavigationDelegate
 
 - (BOOL)isHarnessURL:(NSURL *)url {
-    NSURL *base = DSHHarness.shared.baseURL;
+    NSURL *base = DSHHarness.shared.serverWebURL ?: DSHHarness.shared.baseURL;
     return base != nil && [url.host isEqualToString:base.host] && [url.port isEqual:base.port ?: @80];
 }
 

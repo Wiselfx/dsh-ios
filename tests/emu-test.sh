@@ -14,8 +14,8 @@ ROOT="$(cd "$HERE/.." && pwd)"
 ISH_SRC="${ISH_SRC:-$ROOT/ish-arm64}"
 ISH_BUILD="${ISH_BUILD:-$ISH_SRC/build-arm64-release}"
 WORK="${WORK:-$ROOT/build/emu-test}"
-ALPINE_TARBALL="$ROOT/build/rootfs-work/alpine-minirootfs-3.21.0-aarch64.tar.gz"
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+ALPINE_TARBALL="$ROOT/build/rootfs-work/alpine-minirootfs-3.23.0-aarch64.tar.gz"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/alpine-minirootfs-3.23.0-aarch64.tar.gz"
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }

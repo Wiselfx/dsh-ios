@@ -33,6 +33,7 @@ NSString *DSHHarnessStateName(DSHHarnessState state) {
 @property (nonatomic, readwrite) uint16_t port;
 @property (nonatomic, readwrite) DSHLogBuffer *log;
 @property (nonatomic, readwrite) NSUInteger restartCount;
+@property (nonatomic, readwrite, nullable) NSURL *serverWebURL;
 @property (nonatomic, readwrite, nullable) NSString *lastError;
 @property (nonatomic, readwrite) int guestPid;
 @property (nonatomic, readwrite) NSTimeInterval lastStartupDuration;
@@ -158,6 +159,7 @@ NSString *DSHHarnessStateName(DSHHarnessState state) {
     }
     self.port = port;
     self.lastError = nil;
+    self.serverWebURL = nil;   // each boot prints a fresh token
     self.lastLaunchAt = NSDate.date;
     self.state = DSHHarnessStateStarting;
 
@@ -171,6 +173,19 @@ NSString *DSHHarnessStateName(DSHHarnessState state) {
                                   environment:env
                                          line:^(NSString *line, BOOL isStdErr) {
         [weakSelf.log append:line];
+        // The web profile (dsh >= 0.2.x) only answers with a launch token:
+        // it prints "dsh web: http://127.0.0.1:<port>/?token=..." at boot.
+        // Capture it so the web view can authenticate on first load.
+        if (!isStdErr) {
+            NSRange marker = [line rangeOfString:@"dsh web: "];
+            if (marker.location != NSNotFound) {
+                NSString *candidate = [line substringFromIndex:NSMaxRange(marker)];
+                NSURL *parsed = [NSURL URLWithString:[candidate stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]];
+                if (parsed.scheme != nil && parsed.host != nil) {
+                    weakSelf.serverWebURL = parsed;
+                }
+            }
+        }
     } exit:^(int exitCode) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf processExitedWithCode:exitCode generation:generation];
