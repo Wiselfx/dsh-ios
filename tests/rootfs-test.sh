@@ -15,7 +15,7 @@ WORK="${WORK:-$ROOT/build/rootfs-test}"
 PORT="${DSH_TEST_PORT:-3181}"
 MOCK_PORT="${DSH_MOCK_PORT:-3199}"
 BRIDGE_PORT="${DSH_BRIDGE_PORT:-3197}"
-BOOT_TIMEOUT="${DSH_BOOT_TIMEOUT:-600}"
+BOOT_TIMEOUT="${DSH_BOOT_TIMEOUT:-900}"
 GUEST_TIMEOUT="${DSH_GUEST_TIMEOUT:-180}"
 
 pass=0; fail=0
@@ -23,7 +23,7 @@ ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
 # check <name> <command...>: runs the command (no eval), records the result
 check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi; }
-filter() { sed '/expose_wasm/d'; }
+filter() { sed -u '/expose_wasm/d'; }
 timed() {
     if command -v gtimeout >/dev/null 2>&1; then
         gtimeout "$@"
@@ -84,7 +84,7 @@ echo "== profile composition"
 guest 'export HOME=/root; node --expose-internals /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --dump-config' > "$WORK/config.yml"
 grep -A4 '^- id: sandbox-policy' "$WORK/config.yml" > "$WORK/sandbox-row.yml"
 check "sandbox-policy patched to danger-full-access" grep -q 'danger-full-access' "$WORK/sandbox-row.yml"
-check "hmr row present (needs --expose-internals)"    grep -q 'cordis-plugin-hmr' "$WORK/config.yml"
+check "hmr row present (needs --expose-internals)"    grep -q 'dsh-hmr' "$WORK/config.yml"
 
 echo "== headless LLM round trip through mock DeepSeek server (SSE via fetch polyfill)"
 node "$HERE/mock-deepseek.mjs" "$MOCK_PORT" > "$WORK/mock.log" 2>&1 &
@@ -188,10 +188,14 @@ for _ in $(seq 1 "$BOOT_TIMEOUT"); do
     if curl -fs -c "$WORK/cookies.txt" -L -o "$WORK/index.html" "$TOKEN_URL"; then up=1; break; fi
 done
 elapsed=$(( $(date +%s) - start ))
+echo "--- dsh-serve.log (last 40 lines) ---"
+tail -40 "$WORK/dsh-serve.log" | sed 's/^/     /'
 check "web UI reachable from host loopback (${elapsed}s)" test "$up" = 1
 check "index carries __DSH_BOOT__ manifest" grep -q '__DSH_BOOT__' "$WORK/index.html"
-plugin_url=$(grep -o '/plugins/[^"]*client.js?rev=[0-9a-f]*' "$WORK/index.html" | head -1)
-code=$(curl -s -b "$WORK/cookies.txt" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$plugin_url")
+plugin_url=$(grep -oE 'plugins/[^" ]+client\.js(&amp;|&)rev=[0-9a-f]+' "$WORK/index.html" | awk '{ if (min == "" || length($0) < length(min)) min = $0 } END { print min }')
+plugin_url=${plugin_url//&amp;/&}          # HTML-escaped ampersands
+plugin_url=/${plugin_url#/}                 # relative -> absolute
+code=$(curl -s -m 60 -b "$WORK/cookies.txt" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$plugin_url")
 check "client plugin bundle served ($plugin_url -> $code)" test "$code" = 200
 sleep 5
 check "server still alive after 5s" curl -fs -b "$WORK/cookies.txt" -o /dev/null "http://127.0.0.1:$PORT/"

@@ -10,7 +10,13 @@ step "node $(node -v 2>/dev/null)"
 [ -x /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js ] || die "dsh missing"
 step "dsh $(dsh --version 2>/dev/null)"
 cd /usr/local/lib/node_modules || die "node_modules missing"
-node -e "require('node-pty'); require('koffi'); require('@vscode/ripgrep'); require('sharp')" 2>/dev/null || die "native modules do not load"
+node -e "
+let ok = true;
+for (const m of ['node-pty', 'koffi', '@vscode/ripgrep', 'sharp']) {
+  try { require(m); console.log('ok: ' + m); }
+  catch (e) { console.log('FAIL: ' + m + ' -> ' + String((e && e.message) || e).slice(0, 300)); ok = false; }
+}
+process.exit(ok ? 0 : 1);" || die "native modules do not load"
 step "native modules load"
 node -e "
 const p=require('node-pty');

@@ -28,7 +28,7 @@ die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 # `sed` deliberately returns success for empty input while `pipefail` still
 # propagates a failing emulator command.  The old `grep ... || true` hid guest
 # failures and could export a corrupt image as a successful build.
-filter() { sed '/expose_wasm/d'; }
+filter() { sed -u '/expose_wasm/d'; }
 
 ish() {
     # ish <script-on-stdin>; runs /bin/sh inside the fakefs

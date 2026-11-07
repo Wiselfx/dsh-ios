@@ -24,7 +24,7 @@ install -m 0644 /usr/local/share/dsh/home.patch.yml "$DSH_HOME/cordis.patch.yml"
 
 cd "$DSH_WORKSPACE"
 
-# --expose-internals: cordis-plugin-hmr needs Node internals; the prebuilt
+# --expose-internals: dsh-hmr needs Node internals; the prebuilt
 # node-addon-require-builtin shim has no musl build, so use the flag instead.
 exec node --expose-internals \
     /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js \
