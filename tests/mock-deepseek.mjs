@@ -17,6 +17,93 @@ const argsFlag = process.argv.indexOf('--tool-args');
 const TOOL_ARGS = argsFlag > 0 ? process.argv[argsFlag + 1] : '{}';
 
 
+// Anthropic-compatible Messages API (what dsh >= 0.2.x speaks): POST /v1/messages.
+// SSE framing mirrors https://docs.anthropic.com/en/api/messages-streaming.
+function sse(res, events) {
+  for (const [type, data] of events) {
+    res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+}
+
+function toolResultText(result) {
+  const c = result?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map((b) => (b && typeof b === 'object' ? (b.text ?? JSON.stringify(b)) : String(b))).join(' ');
+  return JSON.stringify(c ?? '');
+}
+
+function messagesHandler(req, res, body) {
+  let payload = {};
+  try { payload = JSON.parse(body || '{}'); } catch { /* ignore */ }
+  const model = payload.model ?? 'deepseek-chat';
+  const id = 'msg_mock_1';
+  const messages = payload.messages ?? [];
+  const tools = payload.tools ?? [];
+  const lastToolResult = (() => {
+    for (const m of [...messages].reverse()) {
+      const blocks = Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }];
+      for (const b of blocks) if (b && b.type === 'tool_result') return b;
+    }
+    return null;
+  })();
+  const offers = tools.some((t) => (t.name ?? t.function?.name) === TOOL);
+  if (TOOL) {
+    console.log('[mock] tools offered:', tools.map((t) => t.name ?? t.function?.name).join(', ') || '(none)');
+    if (lastToolResult) console.log('[mock] tool result:', JSON.stringify(lastToolResult).slice(0, 400));
+  }
+  const wantTool = TOOL && !lastToolResult && offers;
+  let text = REPLY;
+  if (TOOL) {
+    const observed = lastToolResult ? toolResultText(lastToolResult) : '(no tool result)';
+    text = `TOOL-RESULT-BEGIN ${observed.slice(0, 800)} TOOL-RESULT-END`;
+  }
+
+  if (payload.stream === false) {
+    const content = wantTool
+      ? [{ type: 'tool_use', id: 'toolu_mock_1', name: TOOL, input: JSON.parse(TOOL_ARGS) }]
+      : [{ type: 'text', text }];
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id, type: 'message', role: 'assistant', model, content,
+      stop_reason: wantTool ? 'tool_use' : 'end_turn',
+      usage: { input_tokens: 20, output_tokens: 12 },
+    }));
+    return;
+  }
+
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  sse(res, [
+    ['message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', content: [], model, stop_reason: null, usage: { input_tokens: 20, output_tokens: 1 } } }],
+  ]);
+  if (wantTool) {
+    sse(res, [
+      ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_mock_1', name: TOOL, input: {} } }],
+      ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: TOOL_ARGS } }],
+      ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+      ['message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 8 } }],
+      ['message_stop', { type: 'message_stop' }],
+    ]);
+    res.end();
+    return;
+  }
+  sse(res, [['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }]]);
+  const words = text.split(' ');
+  let i = 0;
+  const timer = setInterval(() => {
+    if (i < words.length) {
+      sse(res, [['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: (i ? ' ' : '') + words[i++] } }]]);
+      return;
+    }
+    clearInterval(timer);
+    sse(res, [
+      ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+      ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 24 } }],
+      ['message_stop', { type: 'message_stop' }],
+    ]);
+    res.end();
+  }, 20);
+}
+
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -25,6 +112,9 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ object: 'list', data: [{ id: 'deepseek-chat', object: 'model' }] }));
       return;
+    }
+    if (req.method === 'POST' && req.url.includes('/v1/messages')) {
+      messagesHandler(req, res, body); return;
     }
     if (req.method !== 'POST' || !req.url.includes('/chat/completions')) {
       res.writeHead(404); res.end('not found'); return;
