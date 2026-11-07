@@ -33,6 +33,8 @@ jobs:
           uname -m
           node --version
           ruby --version
+          hostname
+          hostname | wc -c
 
       - name: Install build dependencies
         run: |
