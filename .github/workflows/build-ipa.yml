@@ -37,7 +37,7 @@ jobs:
       - name: Install build dependencies
         run: |
           export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
-          brew install meson lld
+          brew install meson lld libarchive
           gem install xcodeproj --no-document
 
       - name: Cache guest rootfs
