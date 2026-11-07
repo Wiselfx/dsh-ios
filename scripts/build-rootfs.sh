@@ -73,13 +73,19 @@ log "Guest phase 2: install node_modules + polyfills + overlay"
 rm -rf payload && mkdir -p payload/usr/local/lib payload/lib
 mv stage/node_modules payload/usr/local/lib/node_modules
 # npm retains every optional sharp binary named in the lockfile even when the
-# target is pinned to linux/arm64/musl.  The glibc build cannot load on Alpine,
-# and the wasm fallback cannot run under DSH's jitless Node.  Keep only the
-# musl/arm64 pair that sharp actually selects in the guest.  Also strip macOS
-# AppleDouble files before they become tens of thousands of fakefs entries.
+# target is pinned to linux/arm64/musl.  The glibc builds cannot load on Alpine
+# at all, and the loader tries them first and then dies with an illegal
+# instruction instead of falling back cleanly (koffi, sherpa-onnx: the same
+# crash took the guest process down mid-`require()`).  Keep only the musl/arm64
+# pair that sharp actually selects in the guest; drop the glibc koffi binary
+# (the package ships both and its index.js tries linux_arm64 first) and
+# sherpa-onnx-linux-arm64 (glibc-only, used solely by the experimental
+# voice STT plugin, which cannot work in the guest anyway).
 rm -rf payload/usr/local/lib/node_modules/@img/sharp-linux-arm64 \
        payload/usr/local/lib/node_modules/@img/sharp-libvips-linux-arm64 \
-       payload/usr/local/lib/node_modules/@img/sharp-wasm32
+       payload/usr/local/lib/node_modules/@img/sharp-wasm32 \
+       payload/usr/local/lib/node_modules/@koromix/koffi-linux-arm64/linux_arm64 \
+       payload/usr/local/lib/node_modules/sherpa-onnx-linux-arm64
 cp "$ISH_SRC"/app/RootfsPatch.bundle/files/lib/*.js payload/lib/
 # Record the overlay version so the app does not re-apply (and downgrade) the
 # same RootfsPatch files on first launch.
